@@ -1,0 +1,78 @@
+#!/bin/bash
+#
+# cob — "check out branch". Fuzzy-find a local git branch by name fragment and
+# check it out. If multiple branches match, prompt to pick one.
+#
+#   Usage: cob <branch-name-fragment> [-f|--force]
+
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+  echo "Not inside a Git repository."
+  exit 1
+fi
+
+force_checkout=""
+branch_query=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--force)
+      force_checkout="--force"
+      shift
+      ;;
+    *)
+      if [ -z "$branch_query" ]; then
+        branch_query="$1"
+        shift
+      else
+        echo "Unexpected argument: $1"
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [ -z "$branch_query" ]; then
+  echo "Usage: cob <branch-name-fragment> [-f|--force]"
+  exit 1
+fi
+
+branch_names=()
+matches=()
+
+while IFS= read -r line; do
+  branch=$(cut -d'|' -f1 <<< "$line")
+  display=$(cut -d'|' -f2 <<< "$line")
+  branch_names+=("$branch")
+  matches+=("$display")
+done < <(
+  git for-each-ref --sort=committerdate \
+    --format='%(refname:short)|%(refname:short) - %(committerdate:relative) - %(objectname:short) - %(contents:subject)' \
+    refs/heads/ | grep -i ".*$branch_query.* -" | grep -Ev '^(bu-|backup)'
+)
+
+count=${#matches[@]}
+branch_name=""
+
+if [ "$count" -eq 0 ]; then
+  echo "No matching branches found for '$branch_query'"
+  exit 1
+elif [ "$count" -eq 1 ]; then
+  branch_name="${branch_names[0]}"
+else
+  echo "Multiple branches found:"
+  for i in "${!matches[@]}"; do
+    echo "[$i] ${matches[i]}"
+  done
+  echo -n "Choose a branch number to checkout: "
+  read -r selection
+  if [[ "$selection" =~ ^[0-9]+$ && "$selection" -ge 0 && "$selection" -lt $count ]]; then
+    branch_name="${branch_names[$selection]}"
+  else
+    echo "Invalid selection"
+    exit 1
+  fi
+fi
+
+echo "git checkout $force_checkout $branch_name"
+git checkout $force_checkout "$branch_name"
