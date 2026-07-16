@@ -1,0 +1,29 @@
+# freshshell.com
+#
+# Examples:
+#
+#   fresh twe4ked/dotfiles shell/functions/\*
+#   fresh jasoncodes/dotfiles shell/aliases/rails.sh
+#   fresh jasoncodes/dotfiles config/tmux.conf --file
+#
+# See http://freshshell.com/readme for documentation.
+
+fresh freshshell/fresh bin/fresh --bin
+
+# --- Environment & runtime ---
+fresh ColinElective/FreshShell shell/env.sh
+fresh ColinElective/FreshShell shell/nvm.sh
+
+# --- Aliases ---
+fresh ColinElective/FreshShell shell/aliases/\*
+
+# --- Functions ---
+fresh ColinElective/FreshShell shell/functions/\*
+
+# --- Login banner (sourced last) ---
+fresh ColinElective/FreshShell shell/startup.sh
+
+# --- Executables (bin/) ---
+fresh ColinElective/FreshShell bin/cob --bin
+
+fresh foobacca/dotfiles shell/aliases-dir
