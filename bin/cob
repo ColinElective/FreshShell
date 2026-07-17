@@ -1,9 +1,4 @@
 #!/bin/bash
-#
-# cob — "check out branch". Fuzzy-find a local git branch by name fragment and
-# check it out. If multiple branches match, prompt to pick one.
-#
-#   Usage: cob <branch-name-fragment> [-f|--force]
 
 if ! git rev-parse --is-inside-work-tree &>/dev/null; then
   echo "Not inside a Git repository."
@@ -12,12 +7,17 @@ fi
 
 force_checkout=""
 branch_query=""
+prune_worktree=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -f|--force)
       force_checkout="--force"
+      shift
+      ;;
+    --prune)
+      prune_worktree="true"
       shift
       ;;
     *)
@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$branch_query" ]; then
-  echo "Usage: cob <branch-name-fragment> [-f|--force]"
+  echo "Usage: cob <branch-name-fragment> [-f|--force] [--prune]"
   exit 1
 fi
 
@@ -75,4 +75,39 @@ else
 fi
 
 echo "git checkout $force_checkout $branch_name"
-git checkout $force_checkout "$branch_name"
+
+# Capture combined output so we can inspect failures
+checkout_output=$(git checkout $force_checkout "$branch_name" 2>&1)
+checkout_status=$?
+echo "$checkout_output"
+
+# If checkout failed because the branch is tied to an existing worktree,
+# and --prune was requested, offer to remove that worktree and retry.
+if [ "$checkout_status" -ne 0 ] && [ -n "$prune_worktree" ] \
+   && echo "$checkout_output" | grep -q "is already used by worktree at"; then
+
+  worktree_path=$(echo "$checkout_output" | sed -n "s/.*is already used by worktree at '\(.*\)'.*/\1/p")
+
+  if [ -z "$worktree_path" ]; then
+    echo "Could not determine the worktree path from the error output."
+    exit "$checkout_status"
+  fi
+
+  echo -n "Do you want to 'rm -rf $worktree_path'? [y/N] "
+  read -r answer
+  case "$answer" in
+    y|Y|yes|Yes|YES)
+      rm -rf "$worktree_path"
+      git worktree prune
+      echo "git checkout $force_checkout $branch_name"
+      git checkout $force_checkout "$branch_name"
+      exit $?
+      ;;
+    *)
+      echo "Aborted."
+      exit "$checkout_status"
+      ;;
+  esac
+fi
+
+exit "$checkout_status"
