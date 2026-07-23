@@ -23,6 +23,9 @@ fresh ColinElective/FreshShell shell/functions/\*
 # --- Login banner (sourced last) ---
 fresh ColinElective/FreshShell shell/startup.sh
 
+# --- Git config (aliases via [include] in ~/.gitconfig) ---
+fresh ColinElective/FreshShell git/aliases.gitconfig --file ~/.gitconfig.fresh
+
 # --- Executables (bin/) ---
 fresh ColinElective/FreshShell bin/cob --bin
 
