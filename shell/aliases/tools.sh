@@ -3,4 +3,3 @@
 # Launch Claude in a fresh git worktree.
 alias cw="claude --worktree"
 
-alias hi="echo 'hello'"
