@@ -2,3 +2,5 @@
 
 # Launch Claude in a fresh git worktree.
 alias cw="claude --worktree"
+
+alias today="i dunno lol"
