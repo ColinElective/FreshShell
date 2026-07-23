@@ -4,3 +4,5 @@
 alias cw="claude --worktree"
 
 alias cr="echo 'claude says hi'"
+
+alias foo="echo 'bar'"
