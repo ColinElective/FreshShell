@@ -14,9 +14,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -f|--force)
       force_checkout="--force"
-      shift
-      ;;
-    --prune)
       prune_worktree="true"
       shift
       ;;
@@ -33,7 +30,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$branch_query" ]; then
-  echo "Usage: cob <branch-name-fragment> [-f|--force] [--prune]"
+  echo "Usage: cob <branch-name-fragment> [-f|--force]"
   exit 1
 fi
 
@@ -82,7 +79,7 @@ checkout_status=$?
 echo "$checkout_output"
 
 # If checkout failed because the branch is tied to an existing worktree,
-# and --prune was requested, offer to remove that worktree and retry.
+# and -f/--force was requested, offer to remove that worktree and retry.
 if [ "$checkout_status" -ne 0 ] && [ -n "$prune_worktree" ] \
    && echo "$checkout_output" | grep -q "is already used by worktree at"; then
 
