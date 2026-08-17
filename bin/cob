@@ -34,6 +34,27 @@ if [ -z "$branch_query" ]; then
   exit 1
 fi
 
+# Prints the admin directory ($GIT_COMMON_DIR/worktrees/<id>) registered for a
+# worktree path, empty if none matches. The <id> is not reliably the basename of
+# the path - git appends a suffix when two worktrees share a basename - so match
+# on the gitdir file contents instead of guessing the name.
+worktree_admin_dir() {
+  local target="$1"
+  local common_dir gitdir_file
+
+  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || common_dir=$(git rev-parse --git-common-dir 2>/dev/null) \
+    || return 0
+
+  for gitdir_file in "$common_dir"/worktrees/*/gitdir; do
+    [ -f "$gitdir_file" ] || continue
+    if [ "$(cat "$gitdir_file")" = "$target/.git" ]; then
+      dirname "$gitdir_file"
+      return 0
+    fi
+  done
+}
+
 branch_names=()
 matches=()
 
@@ -90,12 +111,37 @@ if [ "$checkout_status" -ne 0 ] && [ -n "$prune_worktree" ] \
     exit "$checkout_status"
   fi
 
-  echo -n "Do you want to 'rm -rf $worktree_path'? [y/N] "
+  if [ "$worktree_path" = "/" ] || [ "$worktree_path" = "$(git rev-parse --show-toplevel)" ]; then
+    echo "Refusing to remove $worktree_path."
+    exit "$checkout_status"
+  fi
+
+  # Look the registration up before removing anything: once the admin entry is
+  # gone there is nothing left to match against.
+  admin_dir=$(worktree_admin_dir "$worktree_path")
+
+  if [ -n "$admin_dir" ] && [ -f "$admin_dir/locked" ]; then
+    echo "That worktree is locked: $(cat "$admin_dir/locked")"
+    echo "Claude Code locks its session worktrees; removing one breaks that session."
+  fi
+
+  echo -n "Do you want to remove the worktree at $worktree_path? [y/N] "
   read -r answer
   case "$answer" in
     y|Y|yes|Yes|YES)
-      rm -rf "$worktree_path"
-      git worktree prune
+      # Two --force flags on purpose: the first accepts a dirty worktree, the
+      # second overrides a lock. A single one fails on a locked worktree.
+      if ! git worktree remove --force --force "$worktree_path" 2>/dev/null; then
+        # Fallback for a worktree git can no longer match - usually the directory
+        # was already deleted by hand. `git worktree prune` skips locked entries,
+        # so the lock file has to go first or the registration survives and the
+        # branch stays "already used by worktree at ...".
+        rm -rf "$worktree_path"
+        if [ -n "$admin_dir" ]; then
+          rm -f "$admin_dir/locked"
+        fi
+        git worktree prune
+      fi
       echo "git checkout $force_checkout $branch_name"
       git checkout $force_checkout "$branch_name"
       exit $?
