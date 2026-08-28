@@ -1,0 +1,129 @@
+#!/bin/bash
+#
+# mrpost - build the code-review message for the review channel.
+#
+# Lists your open, non-draft merge requests in the current repo via glab,
+# oldest first, and prints them as plain text ready to paste. No markup: the
+# chat composer does not interpret it, so asterisks would show up literally.
+
+set -uo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: mrpost [options]
+
+  -a, --author <username>  GitLab author to query (default: $MRPOST_AUTHOR,
+                           else the user glab is authenticated as)
+  -c, --copy               Also copy the message to the clipboard (pbcopy).
+  -h, --help               Show this help.
+
+Environment:
+  MRPOST_AUTHOR            GitLab username to query.
+USAGE
+}
+
+author=""
+copy=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--author)  author="${2:-}"; shift 2 ;;
+    -c|--copy)    copy="true"; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            echo "Unexpected argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+for cmd in glab jq; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required but not installed." >&2; exit 1; }
+done
+
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+  echo "Not inside a Git repository." >&2
+  exit 1
+fi
+
+# --- Who are we asking about? ----------------------------------------------
+# glab resolves @me for assignee/reviewer but not reliably for --author, so
+# look the username up explicitly.
+if [ -z "$author" ]; then
+  author="${MRPOST_AUTHOR:-}"
+fi
+if [ -z "$author" ]; then
+  author=$(glab api user 2>/dev/null | jq -r '.username // empty')
+fi
+if [ -z "$author" ]; then
+  echo "Could not determine a GitLab author. Set MRPOST_AUTHOR or run 'glab auth login'." >&2
+  exit 1
+fi
+
+# --- Fetch the MRs ----------------------------------------------------------
+mrs_json=$(glab mr list --author="$author" --not-draft --per-page 100 --output json 2>/dev/null)
+if [ -z "$mrs_json" ] || ! jq -e 'type == "array"' <<<"$mrs_json" >/dev/null 2>&1; then
+  echo "Could not list merge requests for '$author' in this repo." >&2
+  exit 1
+fi
+
+# Oldest first: the ones that have been waiting longest lead the message.
+# --not-draft is re-checked here because the flag only filters server-side.
+rows=$(jq -r '
+  map(select(.draft != true and .state == "opened"))
+  | sort_by(.created_at)
+  | .[]
+  | [(.iid|tostring), .title, .web_url, .created_at]
+  | @tsv
+' <<<"$mrs_json")
+
+if [ -z "$rows" ]; then
+  echo "No open, non-draft merge requests authored by $author in this repo." >&2
+  exit 0
+fi
+
+# --- Helpers ----------------------------------------------------------------
+
+# Seconds since an ISO 8601 UTC timestamp like 2026-08-27T17:00:47.872Z.
+age_seconds() {
+  local iso="${1%%.*}"     # drop fractional seconds
+  iso="${iso%Z}"           # drop the trailing Z
+  local then
+  then=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$iso" +%s 2>/dev/null) || return 1
+  echo $(( $(date +%s) - then ))
+}
+
+plural() { [ "$1" -eq 1 ] && echo "$1 $2" || echo "$1 ${2}s"; }
+
+human_age() {
+  local secs="$1"
+  if   [ "$secs" -lt 3600 ];    then plural $(( secs / 60 )) minute
+  elif [ "$secs" -lt 86400 ];   then plural $(( secs / 3600 )) hour
+  elif [ "$secs" -lt 1209600 ]; then plural $(( secs / 86400 )) day
+  else                               plural $(( secs / 604800 )) week
+  fi
+}
+
+# --- Build the message ------------------------------------------------------
+message=""
+
+while IFS=$'\t' read -r iid title web_url created_at; do
+  [ -n "$iid" ] || continue
+
+  secs=$(age_seconds "$created_at")
+  if [ -n "$secs" ]; then
+    age="Opened $(human_age "$secs") ago"
+  else
+    age="Opened $created_at"
+  fi
+
+  message+="!${iid} — ${title}"$'\n'
+  message+="${web_url}"$'\n'
+  message+="${age}"$'\n\n'
+done <<<"$rows"
+
+message="${message%$'\n\n'}"
+
+printf '%s\n' "$message"
+
+if [ -n "$copy" ] && command -v pbcopy >/dev/null 2>&1; then
+  printf '%s\n' "$message" | pbcopy
+  echo "Copied to clipboard." >&2
+fi

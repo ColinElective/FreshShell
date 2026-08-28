@@ -28,5 +28,6 @@ fresh ColinElective/FreshShell git/aliases.gitconfig --file ~/.gitconfig.fresh
 
 # --- Executables (bin/) ---
 fresh ColinElective/FreshShell bin/cob --bin
+fresh ColinElective/FreshShell bin/mrpost --bin
 
 fresh foobacca/dotfiles shell/aliases-dir

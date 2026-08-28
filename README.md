@@ -31,6 +31,35 @@ bin/                 standalone executables (linked via --bin)
    source ~/.fresh/build/shell.sh   # already sourced by ~/.zshrc on login
    ```
 
+## `mrpost`
+
+Generates the code-review message to paste into the review channel. Run it
+inside a GitLab repo:
+
+```sh
+mrpost          # print the message
+mrpost -c       # ...and copy it to the clipboard
+```
+
+It lists your open, non-draft merge requests via `glab`, oldest first, so the
+ones that have been waiting longest lead the message:
+
+```
+!401 — Bump node to 22
+https://gitlab.com/wize-apps/web/-/merge_requests/401
+Opened 2 weeks ago
+
+!412 — Fix phone input validation
+https://gitlab.com/wize-apps/web/-/merge_requests/412
+Opened 3 days ago
+```
+
+Deliberately plain text — the chat composer does not interpret markdown on
+paste, so any asterisks would show up literally.
+
+`MRPOST_AUTHOR` overrides the GitLab username, which otherwise comes from
+whoever `glab` is logged in as.
+
 ## Notes
 
 - Homebrew paths resolve via `brew --prefix`, so they work on both Apple
