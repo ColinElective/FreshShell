@@ -5,6 +5,12 @@
 # Lists your open, non-draft merge requests in the current repo via glab,
 # oldest first, and prints them as plain text ready to paste. No markup: the
 # chat composer does not interpret it, so asterisks would show up literally.
+#
+# Every generated message is also saved to $MRPOST_DIR, which defaults to
+# .mrpost at the repository root.
+# Those saved copies are the record of what has already been posted: each run
+# is assumed to end up in the channel, so one history file is one post. That
+# is what lets a later run say how many times an MR has been chased already.
 
 set -uo pipefail
 
@@ -14,25 +20,68 @@ Usage: mrpost [options]
 
   -a, --author <username>  GitLab author to query (default: $MRPOST_AUTHOR,
                            else the user glab is authenticated as)
-  -c, --copy               Also copy the message to the clipboard (pbcopy).
+  -c, --copy               Copy the message to the clipboard (pbcopy). On by
+                           default; use --no-copy to turn it off.
+      --no-copy            Print the message without touching the clipboard.
+      --pc, --post-count   Add "- Posted here N times" to each MR, counted
+                           from past messages. Off by default.
+  -y, --yes                Include every MR without asking, even ones that
+                           already have review comments.
   -h, --help               Show this help.
 
 Environment:
   MRPOST_AUTHOR            GitLab username to query.
+  MRPOST_NOTICE_MARKER     Any comment whose body contains this never counts
+                           as a review (default: NX_CLOUD_APP_COMMENT_END,
+                           the marker Nx Cloud signs its CI summary with).
+                           Blank it to disable the rule.
+  MRPOST_IGNORE_COMMENTERS Comma-separated usernames whose comments never
+                           count as a review (default: ghost1, the account
+                           CodeRabbit and Linear post under).
+  MRPOST_DIR               Where to keep past messages (default: .mrpost at
+                           the repository root).
+                           Each run saves a copy there, and every saved copy
+                           counts as one post to the channel.
 USAGE
 }
 
 author=""
-copy=""
+copy="true"
+assume_yes=""
+show_post_count=""
+ignore_commenters="${MRPOST_IGNORE_COMMENTERS-ghost1}"
+# Nx Cloud posts its CI summary under a real person's account, so it cannot be
+# filtered by username. It signs the body with this HTML marker, which is a
+# surer match than the visible text - that can be reworded, the marker cannot.
+notice_marker="${MRPOST_NOTICE_MARKER-NX_CLOUD_APP_COMMENT_END}"
+history_dir="${MRPOST_DIR:-}"
+history_ext=".txt"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -a|--author)  author="${2:-}"; shift 2 ;;
     -c|--copy)    copy="true"; shift ;;
+    --no-copy)    copy=""; shift ;;
+    -y|--yes)     assume_yes="true"; shift ;;
+    -pc|--pc|--post-count) show_post_count="true"; shift ;;
     -h|--help)    usage; exit 0 ;;
     *)            echo "Unexpected argument: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+# Progress notices go to stderr, and only to a terminal: stdout has to stay
+# clean for a pipe, and a log file should not collect half-drawn lines. Each
+# notice overwrites the one before it and the last is erased, so the finished
+# run leaves no trace of them behind.
+progress() {
+  [ -t 2 ] || return 0
+  printf '\r\033[K%s' "$*" >&2
+}
+
+progress_clear() {
+  [ -t 2 ] || return 0
+  printf '\r\033[K' >&2
+}
 
 for cmd in glab jq; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required but not installed." >&2; exit 1; }
@@ -41,6 +90,13 @@ done
 if ! git rev-parse --is-inside-work-tree &>/dev/null; then
   echo "Not inside a Git repository." >&2
   exit 1
+fi
+
+# Anchor the history to the repo root, not the working directory. Running from
+# the root and from a subdirectory of a monorepo would otherwise build two
+# separate histories that cannot see each other, silently undercounting.
+if [ -z "$history_dir" ]; then
+  history_dir="$(git rev-parse --show-toplevel)/.mrpost"
 fi
 
 # --- Who are we asking about? ----------------------------------------------
@@ -58,7 +114,9 @@ if [ -z "$author" ]; then
 fi
 
 # --- Fetch the MRs ----------------------------------------------------------
+progress "Fetching list of MRs..."
 mrs_json=$(glab mr list --author="$author" --not-draft --per-page 100 --output json 2>/dev/null)
+progress_clear
 if [ -z "$mrs_json" ] || ! jq -e 'type == "array"' <<<"$mrs_json" >/dev/null 2>&1; then
   echo "Could not list merge requests for '$author' in this repo." >&2
   exit 1
@@ -70,7 +128,8 @@ rows=$(jq -r '
   map(select(.draft != true and .state == "opened"))
   | sort_by(.created_at)
   | .[]
-  | [(.iid|tostring), .title, .web_url, .created_at]
+  | [(.iid|tostring), .title, .web_url, .created_at,
+     (.project_id|tostring), (.user_notes_count // 0 | tostring)]
   | @tsv
 ' <<<"$mrs_json")
 
@@ -92,38 +151,275 @@ age_seconds() {
 
 plural() { [ "$1" -eq 1 ] && echo "$1 $2" || echo "$1 ${2}s"; }
 
+# An hour is the finest unit on purpose. Anything more precise would make the
+# message text change between two runs minutes apart, and the duplicate check
+# below relies on an unchanged message meaning an unchanged situation.
 human_age() {
   local secs="$1"
-  if   [ "$secs" -lt 3600 ];    then plural $(( secs / 60 )) minute
+  if   [ "$secs" -lt 3600 ];    then echo "less than an hour"
   elif [ "$secs" -lt 86400 ];   then plural $(( secs / 3600 )) hour
   elif [ "$secs" -lt 1209600 ]; then plural $(( secs / 86400 )) day
   else                               plural $(( secs / 604800 )) week
   fi
 }
 
+# Past messages that mentioned this MR, oldest first.
+#
+# One history file is one post, so this lists *files* rather than counting
+# occurrences - a link named twice in a single message was still only posted
+# once. Matching is on the host and path so a change of scheme still lines up,
+# with a trailing non-digit boundary so !412 does not also match !4120.
+mentions_of() {
+  local url="$1"
+  local needle="${url#*://}"
+  local escaped
+  escaped=$(printf '%s' "$needle" | sed 's/[.[\*^$()+?{}|\\]/\\&/g')
+
+  # A missing history directory is the normal first-run case, not an error.
+  grep -lE "${escaped}([^0-9]|\$)" "$history_dir"/*"$history_ext" 2>/dev/null | sort
+}
+
+# The most recently written history file, or nothing on a first run. The
+# timestamp format sorts chronologically, so plain lexical order is enough.
+latest_history() {
+  ls -1 "$history_dir"/*"$history_ext" 2>/dev/null | sort | tail -n 1
+}
+
+# Strip the posted count so two messages can be compared on their substance.
+#
+# The count is guaranteed to differ between consecutive runs - the first
+# message has no suffix, the second says "Posted here 1 time" - so comparing it
+# would mean a repeat run never matched the one before it, which is the exact
+# case this is meant to catch.
+without_counts() {
+  sed 's/ - Posted here [0-9][0-9]* times*$//'
+}
+
+# 2026-08-31-142530.txt -> 2026-08-31 14:25. Read from the name rather than the
+# mtime so that copying or restoring the directory does not rewrite history.
+history_date() {
+  local base
+  base=$(basename "$1" "$history_ext")
+  if [[ "$base" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{2})([0-9]{2})[0-9]{2}$ ]]; then
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+  else
+    echo "$base"
+  fi
+}
+
+# Human review comments on one MR, printed as "count<TAB>@name, @name".
+#
+# Four kinds of note are dropped here, each for its own reason:
+#   - system notes are activity, not review. Note that "approved this merge
+#     request" is one of them, so an approval on its own does not count as a
+#     comment - approvals are handled separately, before this is ever called;
+#   - the integration accounts (CodeRabbit, Linear) comment on very nearly
+#     every MR, so counting them would mean confirming every MR every time;
+#   - the author's own notes are context they added themselves;
+#   - the deploy-preview notice, which posts under a real person's account and
+#     so has to be matched on author and opening text together.
+mr_review_comments() {
+  local project_id="$1" iid="$2"
+  local notes
+
+  notes=$(glab api "projects/${project_id}/merge_requests/${iid}/notes?per_page=100" 2>/dev/null)
+  jq -e 'type == "array"' <<<"${notes:-null}" >/dev/null 2>&1 || return 1
+
+  jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
+        --arg marker "$notice_marker" '
+    ($ignore | split(",") | map(select(length > 0))) as $bots
+    | [ .[]
+        | select(.system != true)
+        # The Nx Cloud CI summary, identified by the marker it signs its body
+        # with rather than by its wording. Matched on the body alone: it posts
+        # under a real account, and that person also leaves genuine reviews.
+        | select(($marker == "") or (((.body // "") | contains($marker)) | not))
+        | .author.username
+        | . as $u
+        | select($u != $author and (($bots | index($u)) == null))
+      ] as $who
+    | ($who | unique | map("@" + .)) as $names
+    | "\($who | length)\t\(
+        if ($names | length) <= 3
+        then $names | join(", ")
+        else ($names[0:2] | join(", ")) + " and \(($names | length) - 2) others"
+        end
+      )"
+  ' <<<"$notes"
+}
+
+# Who has approved one MR, printed as "count<TAB>@name, @name".
+#
+# Any approval at all counts. Deliberately not `approvals_left == 0`: a project
+# that requires no approvals reports zero left from the moment it opens, which
+# would drop every MR before anyone had looked at it.
+mr_approvals() {
+  local project_id="$1" iid="$2"
+  local approvals
+
+  approvals=$(glab api "projects/${project_id}/merge_requests/${iid}/approvals" 2>/dev/null)
+  jq -e 'type == "object"' <<<"${approvals:-null}" >/dev/null 2>&1 || return 1
+
+  jq -r '
+    [ .approved_by[]? | .user.username | select(. != null) ] as $who
+    | ($who | unique | map("@" + .)) as $names
+    | "\($who | length)\t\(
+        if ($names | length) <= 3
+        then $names | join(", ")
+        else ($names[0:2] | join(", ")) + " and \(($names | length) - 2) others"
+        end
+      )"
+  ' <<<"$approvals"
+}
+
+# Ask whether an MR that already has review comments should still be chased.
+#
+# The prompt goes to stderr and the answer is read from the terminal rather
+# than stdin: stdout has to stay clean for `mrpost | pbcopy`, and stdin is
+# already spoken for by the loop that feeds this.
+confirm_post() {
+  local iid="$1" web_url="$2" count="$3" who="$4"
+  local answer
+
+  progress_clear
+
+  echo "MR ${iid} has $(plural "$count" comment) from ${who} ${web_url}" >&2
+
+  # Nobody to ask - keep the MR rather than silently shortening the message.
+  if [ ! -e /dev/tty ] || ! : >/dev/tty 2>/dev/null; then
+    echo "Post anyway? y/N - no terminal to ask on, keeping it." >&2
+    return 0
+  fi
+
+  printf 'Post anyway? y/N ' >&2
+  read -r answer </dev/tty || answer=""
+  case "$answer" in
+    y|Y|yes|Yes|YES) return 0 ;;
+    *) echo "Skipping !${iid}." >&2; return 1 ;;
+  esac
+}
+
 # --- Build the message ------------------------------------------------------
 message=""
+approved_list=""
+approved_count=0
 
-while IFS=$'\t' read -r iid title web_url created_at; do
+mr_total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+mr_index=0
+
+while IFS=$'\t' read -r iid title web_url created_at project_id notes_count; do
   [ -n "$iid" ] || continue
+  mr_index=$(( mr_index + 1 ))
+  progress "Fetching MR ${iid}... (${mr_index} of ${mr_total})"
+
+  # An approval is the clearest possible sign the MR has had its review, so it
+  # is dropped outright rather than prompted about. Checked before comments so
+  # an approved MR never asks a question it already has the answer to.
+  if approvals=$(mr_approvals "$project_id" "$iid"); then
+    IFS=$'\t' read -r approval_count approvers <<<"$approvals"
+    if [ "${approval_count:-0}" -gt 0 ]; then
+      approved_list+="  !${iid} approved by ${approvers} ${web_url}"$'\n'
+      approved_count=$(( approved_count + 1 ))
+      continue
+    fi
+  else
+    progress_clear
+    echo "Could not read approvals for !${iid}; treating it as unapproved." >&2
+  fi
+
+  # user_notes_count already excludes system notes, so zero means there is
+  # nothing to look at and the extra API call can be skipped entirely.
+  if [ -z "$assume_yes" ] && [ "${notes_count:-0}" -gt 0 ]; then
+    if comments=$(mr_review_comments "$project_id" "$iid"); then
+      IFS=$'\t' read -r comment_count commenters <<<"$comments"
+      if [ "${comment_count:-0}" -gt 0 ]; then
+        confirm_post "$iid" "$web_url" "$comment_count" "$commenters" || continue
+      fi
+    else
+      progress_clear
+      echo "Could not read comments for !${iid}; including it." >&2
+    fi
+  fi
 
   secs=$(age_seconds "$created_at")
   if [ -n "$secs" ]; then
-    age="Opened $(human_age "$secs") ago"
+    detail="Opened $(human_age "$secs") ago"
   else
-    age="Opened $created_at"
+    detail="Opened $created_at"
+  fi
+
+  # Opt-in: naming the count in the channel is a pointed thing to do, so it is
+  # off unless asked for. History is still recorded either way, so turning the
+  # flag on later reports every message that has already gone out.
+  #
+  # Counted before this run's own file is written, so an MR is never counted as
+  # a mention of itself. Silent the first time an MR appears - there is nothing
+  # to nag about yet; from the second message onwards the count is the point.
+  if [ -n "$show_post_count" ]; then
+    mention_files=$(mentions_of "$web_url")
+    if [ -n "$mention_files" ]; then
+      posted=$(printf '%s\n' "$mention_files" | wc -l | tr -d ' ')
+      detail="$detail - Posted here $(plural "$posted" time)"
+    fi
   fi
 
   message+="!${iid} — ${title}"$'\n'
   message+="${web_url}"$'\n'
-  message+="${age}"$'\n\n'
+  message+="${detail}"$'\n\n'
 done <<<"$rows"
 
 message="${message%$'\n\n'}"
+progress_clear
+
+# What was dropped for being approved. Goes to stderr, below the message, so it
+# stays out of both the paste buffer and the saved history - it is a note to
+# self about MRs that need no chasing, not something the channel needs.
+report_approved() {
+  [ "$approved_count" -gt 0 ] || return 0
+  echo >&2
+  echo "Dropped $(plural "$approved_count" "approved MR"):" >&2
+  printf '%s' "$approved_list" >&2
+}
+
+# Everything was declined - say so rather than emitting a blank message and
+# recording it as a post that went to the channel.
+if [ -z "$message" ]; then
+  echo "Nothing to post." >&2
+  report_approved
+  exit 0
+fi
 
 printf '%s\n' "$message"
 
 if [ -n "$copy" ] && command -v pbcopy >/dev/null 2>&1; then
   printf '%s\n' "$message" | pbcopy
   echo "Copied to clipboard." >&2
+fi
+
+report_approved
+
+# --- Record this run --------------------------------------------------------
+# Last, so the counts above reflect only earlier messages. A directory that
+# cannot be created or written is worth a warning but not a failure: the
+# message is already out, and losing the record beats losing the message.
+if mkdir -p "$history_dir" 2>/dev/null; then
+  previous=$(latest_history)
+
+  # Running twice in a row with nothing changed is a slip, not a second post,
+  # so it should not inflate the counts. Compared on substance rather than
+  # byte-for-byte; see without_counts.
+  if [ -n "$previous" ] && [ -r "$previous" ] \
+     && [ "$(printf '%s\n' "$message" | without_counts)" \
+        = "$(without_counts < "$previous")" ]; then
+    echo "Same message as $(history_date "$previous") - not recording it again." >&2
+  else
+    history_file="$history_dir/$(date +%Y-%m-%d-%H%M%S)$history_ext"
+    # The redirection is what fails on a read-only directory, and bash reports
+    # that itself, so the whole group has to be muffled - not just printf.
+    if ! { printf '%s\n' "$message" > "$history_file"; } 2>/dev/null; then
+      echo "Could not write history file: $history_file" >&2
+    fi
+  fi
+else
+  echo "Could not create history directory: $history_dir" >&2
 fi

@@ -37,9 +37,13 @@ Generates the code-review message to paste into the review channel. Run it
 inside a GitLab repo:
 
 ```sh
-mrpost          # print the message
-mrpost -c       # ...and copy it to the clipboard
+mrpost            # print the message and copy it to the clipboard
+mrpost --no-copy  # print it without touching the clipboard
 ```
+
+While it works it shows a single self-overwriting progress line on stderr
+(`Fetching MR 1464... (3 of 5)`), so a slow run doesn't look hung. It's
+suppressed when stderr isn't a terminal, so pipes and logs stay clean.
 
 It lists your open, non-draft merge requests via `glab`, oldest first, so the
 ones that have been waiting longest lead the message:
@@ -47,15 +51,108 @@ ones that have been waiting longest lead the message:
 ```
 !401 — Bump node to 22
 https://gitlab.com/wize-apps/web/-/merge_requests/401
-Opened 2 weeks ago
+Opened 2 weeks ago - Posted here 3 times
 
 !412 — Fix phone input validation
 https://gitlab.com/wize-apps/web/-/merge_requests/412
-Opened 3 days ago
+Opened 3 days ago - Posted here 1 time
+
+!418 — Add retry to sync worker
+https://gitlab.com/wize-apps/web/-/merge_requests/418
+Opened 6 hours ago
 ```
 
 Deliberately plain text — the chat composer does not interpret markdown on
 paste, so any asterisks would show up literally.
+
+### Post history
+
+Every run saves a copy of the message to `$MRPOST_DIR` — by default `.mrpost`
+at the repository root, created if missing — as `YYYY-MM-DD-HHMMSS.txt`.
+Anchoring to the repo root rather than the working directory matters in a
+monorepo: otherwise running from the root and from `apps/core-api` would build
+two histories that can't see each other, and the counts would under-report. Those copies are the record of
+what has already gone out: **each run is assumed to be posted**, so one file is
+one post.
+
+Pass `--post-count` (or `-pc`) and each MR gains `- Posted here N times`,
+counted from that history — N counts *files*, not mentions, so a link named
+twice in one message still only counts once. An MR appearing for the first time
+gets no suffix; from its second appearance onwards the count shows.
+
+The flag is off by default, since naming the count in the channel is a pointed
+thing to do. History is recorded either way, so turning it on later still
+reports every message that has already gone out.
+
+Re-running by accident does not inflate the history. If the message matches the
+previous one, no new file is written and it says so:
+
+```
+Same message as 2026-08-31 09:11 - not recording it again.
+```
+
+This is why ages are rounded to the hour — "Opened 6 hours ago", never
+"Opened 12 minutes ago". A finer unit would make the text change between two
+runs minutes apart and every repeat would look like a fresh post. The
+comparison also ignores the `- Posted here N times` suffix, since that
+necessarily differs between a first and second run and would otherwise stop any
+repeat from ever matching.
+
+Two consequences: an MR under an hour old reads "Opened less than an hour ago",
+and a repeat run that straddles an hour boundary does write a new file, because
+the message genuinely changed.
+
+Worth adding `.mrpost/` to the `.gitignore` of any repo you run this in.
+
+### Approved MRs
+
+An approval means the review already happened, so an MR with **any** approval is
+dropped from the message automatically — no prompt. The dropped ones are listed
+on stderr, below the message, so they stay out of the paste buffer and out of
+the saved history:
+
+```
+Dropped 2 approved MRs:
+  !401 approved by @snaer https://gitlab.com/.../401
+  !412 approved by @christofferjohansen, @edmond13 https://gitlab.com/.../412
+```
+
+The test is `approved_by` being non-empty, deliberately not `approvals_left ==
+0` — a project that requires no approvals reports zero left from the moment an
+MR opens, which would drop everything before anyone had looked at it.
+
+### Review-comment check
+
+Before an MR goes into the message, `mrpost` checks it for review comments —
+comments usually mean someone has already looked, so nagging the channel may be
+the wrong move. If it finds any, it asks:
+
+```
+MR 412 has 1 comment from @valentina824026 https://gitlab.com/...
+Post anyway? y/N
+```
+
+Answering no drops that MR from the message and from the saved history, so it
+does not accrue a post count for a message it never appeared in. `-y`/`--yes`
+skips the prompting entirely. Prompts go to stderr and read from the terminal,
+so `mrpost | pbcopy` still works.
+
+Three kinds of note are ignored, or the prompt would fire on nearly every MR:
+
+- **System notes** — label changes, assignments, pushes. *approved this merge
+  request* is one of these, which is why approvals are handled separately
+  above rather than through the comment check.
+- **Integration accounts** — CodeRabbit and Linear both post as `ghost1`, which
+  accounts for roughly 80% of all non-system comments on `wize-apps/web`.
+  Override with `MRPOST_IGNORE_COMMENTERS` (comma-separated; set it empty to
+  disable the filter).
+- **Your own comments** — context you added yourself, not a review.
+- **The Nx Cloud CI summary** — it posts under a real person's GitLab account
+  rather than a bot's, so it can't be filtered by username without losing that
+  person's genuine reviews. It's matched instead on the marker it signs its
+  body with, `NX_CLOUD_APP_COMMENT_END` (`MRPOST_NOTICE_MARKER`; blank it to
+  switch the rule off). On `wize-apps/apps` this notice appears on roughly
+  four MRs in five, so without it the prompt would fire almost every time.
 
 `MRPOST_AUTHOR` overrides the GitLab username, which otherwise comes from
 whoever `glab` is logged in as.
