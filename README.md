@@ -51,16 +51,23 @@ ones that have been waiting longest lead the message:
 ```
 !401 — Bump node to 22
 https://gitlab.com/wize-apps/web/-/merge_requests/401
-Opened 2 weeks ago - Posted here 3 times
+Ready for review 2 weeks ago
 
 !412 — Fix phone input validation
 https://gitlab.com/wize-apps/web/-/merge_requests/412
-Opened 3 days ago - Posted here 1 time
+Ready for review 3 days ago
 
 !418 — Add retry to sync worker
 https://gitlab.com/wize-apps/web/-/merge_requests/418
-Opened 6 hours ago
+Ready for review 6 hours ago
 ```
+
+The age is measured from when the MR became **reviewable**, not when it was
+opened — a week spent in draft shouldn't read as a week of people ignoring it.
+GitLab records the flip as a system note (`marked this merge request as
+**ready**`); the newest one wins, since an MR can be flipped more than once. An
+MR opened ready has no such note, and for it the creation date *is* the ready
+date, so the wording stays true either way.
 
 Deliberately plain text — the chat composer does not interpret markdown on
 paste, so any asterisks would show up literally.
@@ -91,14 +98,15 @@ previous one, no new file is written and it says so:
 Same message as 2026-08-31 09:11 - not recording it again.
 ```
 
-This is why ages are rounded to the hour — "Opened 6 hours ago", never
-"Opened 12 minutes ago". A finer unit would make the text change between two
+This is why ages are rounded to the hour — "Ready for review 6 hours ago",
+never "…12 minutes ago". A finer unit would make the text change between two
 runs minutes apart and every repeat would look like a fresh post. The
 comparison also ignores the `- Posted here N times` suffix, since that
 necessarily differs between a first and second run and would otherwise stop any
 repeat from ever matching.
 
-Two consequences: an MR under an hour old reads "Opened less than an hour ago",
+Two consequences: an MR under an hour old reads "Ready for review less than an
+hour ago",
 and a repeat run that straddles an hour boundary does write a new file, because
 the message genuinely changed.
 

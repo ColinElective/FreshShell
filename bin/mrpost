@@ -2,7 +2,8 @@
 #
 # mrpost - build the code-review message for the review channel.
 #
-# Lists your open, non-draft merge requests in the current repo via glab,
+# Lists your open, non-draft merge requests in the current repo via glab, aged
+# from when each became reviewable rather than when it was opened,
 # oldest first, and prints them as plain text ready to paste. No markup: the
 # chat composer does not interpret it, so asterisks would show up literally.
 #
@@ -54,6 +55,7 @@ ignore_commenters="${MRPOST_IGNORE_COMMENTERS-ghost1}"
 # filtered by username. It signs the body with this HTML marker, which is a
 # surer match than the visible text - that can be reworded, the marker cannot.
 notice_marker="${MRPOST_NOTICE_MARKER-NX_CLOUD_APP_COMMENT_END}"
+notes_json=""
 history_dir="${MRPOST_DIR:-}"
 history_ext=".txt"
 
@@ -207,6 +209,36 @@ history_date() {
   fi
 }
 
+# Fetch one MR's notes into $notes_json. Both the ready date and the comment
+# check read them, so they are fetched once and shared rather than twice.
+fetch_notes() {
+  notes_json=$(glab api "projects/$1/merge_requests/$2/notes?per_page=100" 2>/dev/null)
+  jq -e 'type == "array"' <<<"${notes_json:-null}" >/dev/null 2>&1 && return 0
+  notes_json=""
+  return 1
+}
+
+# When the MR became reviewable, falling back to the given creation date.
+#
+# GitLab records the draft/ready flip as a system note. An MR can be flipped
+# more than once, so the newest note wins; an MR opened ready has no such note
+# at all, and for that one the creation date *is* the ready date.
+#
+# The body is anchored rather than searched: an unanchored "ready" also matches
+# the word "already" in an ordinary commit-list note.
+ready_since() {
+  local fallback="$1"
+  [ -n "$notes_json" ] || { echo "$fallback"; return 0; }
+
+  jq -r --arg fallback "$fallback" '
+    [ .[]?
+      | select(.system == true)
+      | select(.body | test("^marked this merge request as \\*\\*ready\\*\\*$|^unmarked as a work in progress"; "i"))
+      | .created_at
+    ] | sort | last // $fallback
+  ' <<<"$notes_json"
+}
+
 # Human review comments on one MR, printed as "count<TAB>@name, @name".
 #
 # Four kinds of note are dropped here, each for its own reason:
@@ -219,12 +251,6 @@ history_date() {
 #   - the deploy-preview notice, which posts under a real person's account and
 #     so has to be matched on author and opening text together.
 mr_review_comments() {
-  local project_id="$1" iid="$2"
-  local notes
-
-  notes=$(glab api "projects/${project_id}/merge_requests/${iid}/notes?per_page=100" 2>/dev/null)
-  jq -e 'type == "array"' <<<"${notes:-null}" >/dev/null 2>&1 || return 1
-
   jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
         --arg marker "$notice_marker" '
     ($ignore | split(",") | map(select(length > 0))) as $bots
@@ -245,7 +271,7 @@ mr_review_comments() {
         else ($names[0:2] | join(", ")) + " and \(($names | length) - 2) others"
         end
       )"
-  ' <<<"$notes"
+  ' <<<"$notes_json"
 }
 
 # Who has approved one MR, printed as "count<TAB>@name, @name".
@@ -327,25 +353,30 @@ while IFS=$'\t' read -r iid title web_url created_at project_id notes_count; do
     echo "Could not read approvals for !${iid}; treating it as unapproved." >&2
   fi
 
-  # user_notes_count already excludes system notes, so zero means there is
-  # nothing to look at and the extra API call can be skipped entirely.
-  if [ -z "$assume_yes" ] && [ "${notes_count:-0}" -gt 0 ]; then
-    if comments=$(mr_review_comments "$project_id" "$iid"); then
-      IFS=$'\t' read -r comment_count commenters <<<"$comments"
-      if [ "${comment_count:-0}" -gt 0 ]; then
-        confirm_post "$iid" "$web_url" "$comment_count" "$commenters" || continue
-      fi
-    else
-      progress_clear
-      echo "Could not read comments for !${iid}; including it." >&2
+  # Fetched unconditionally now: the draft/ready flip is a *system* note, which
+  # user_notes_count does not count, so a comment-free MR can still have one.
+  if ! fetch_notes "$project_id" "$iid"; then
+    progress_clear
+    echo "Could not read notes for !${iid}; dating it from when it was opened." >&2
+  fi
+
+  ready_at=$(ready_since "$created_at")
+
+  # user_notes_count excludes system notes, so zero means there is no human
+  # comment to weigh up and the prompt can be skipped.
+  if [ -z "$assume_yes" ] && [ -n "$notes_json" ] && [ "${notes_count:-0}" -gt 0 ]; then
+    comments=$(mr_review_comments)
+    IFS=$'\t' read -r comment_count commenters <<<"$comments"
+    if [ "${comment_count:-0}" -gt 0 ]; then
+      confirm_post "$iid" "$web_url" "$comment_count" "$commenters" || continue
     fi
   fi
 
-  secs=$(age_seconds "$created_at")
+  secs=$(age_seconds "$ready_at")
   if [ -n "$secs" ]; then
-    detail="Opened $(human_age "$secs") ago"
+    detail="Ready for review $(human_age "$secs") ago"
   else
-    detail="Opened $created_at"
+    detail="Ready for review $ready_at"
   fi
 
   # Opt-in: naming the count in the channel is a pointed thing to do, so it is
