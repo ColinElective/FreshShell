@@ -26,6 +26,9 @@ Usage: mrpost [options]
       --no-copy            Print the message without touching the clipboard.
       --pc, --post-count   Add "- Posted here N times" to each MR, counted
                            from past messages. Off by default.
+  -p, --prev               Reprint the most recent saved message and copy it,
+                           without contacting GitLab at all. For when the last
+                           one was generated but never actually posted.
   -y, --yes                Include every MR without asking, even ones that
                            already have review comments.
   -h, --help               Show this help.
@@ -50,6 +53,7 @@ author=""
 copy="true"
 assume_yes=""
 show_post_count=""
+use_previous=""
 ignore_commenters="${MRPOST_IGNORE_COMMENTERS-ghost1}"
 # Nx Cloud posts its CI summary under a real person's account, so it cannot be
 # filtered by username. It signs the body with this HTML marker, which is a
@@ -66,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --no-copy)    copy=""; shift ;;
     -y|--yes)     assume_yes="true"; shift ;;
     -pc|--pc|--post-count) show_post_count="true"; shift ;;
+    -p|--prev)    use_previous="true"; shift ;;
     -h|--help)    usage; exit 0 ;;
     *)            echo "Unexpected argument: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -85,9 +90,38 @@ progress_clear() {
   printf '\r\033[K' >&2
 }
 
-for cmd in glab jq; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required but not installed." >&2; exit 1; }
-done
+# The most recently written history file, or nothing on a first run. The
+# timestamp format sorts chronologically, so plain lexical order is enough.
+latest_history() {
+  ls -1 "$history_dir"/*"$history_ext" 2>/dev/null | sort | tail -n 1
+}
+
+# 2026-08-31-142530.txt -> 2026-08-31 14:25. Read from the name rather than the
+# mtime so that copying or restoring the directory does not rewrite history.
+history_date() {
+  local base
+  base=$(basename "$1" "$history_ext")
+  if [[ "$base" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{2})([0-9]{2})[0-9]{2}$ ]]; then
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+  else
+    echo "$base"
+  fi
+}
+
+# Deliver the finished message to the clipboard, if that is switched on.
+copy_to_clipboard() {
+  [ -n "$copy" ] || return 0
+  command -v pbcopy >/dev/null 2>&1 || return 0
+  printf '%s\n' "$1" | pbcopy
+  echo "\nCopied to clipboard." >&2
+}
+
+# --prev only reads a file back, so it needs neither of these.
+if [ -z "$use_previous" ]; then
+  for cmd in glab jq; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required but not installed." >&2; exit 1; }
+  done
+fi
 
 if ! git rev-parse --is-inside-work-tree &>/dev/null; then
   echo "Not inside a Git repository." >&2
@@ -99,6 +133,25 @@ fi
 # separate histories that cannot see each other, silently undercounting.
 if [ -z "$history_dir" ]; then
   history_dir="$(git rev-parse --show-toplevel)/.mrpost"
+fi
+
+# --- Reuse the last message -------------------------------------------------
+# Deliberately before anything that talks to GitLab: the whole point is to
+# recover a message that was generated but never posted, without paying for the
+# lookups again. Nothing is recorded either - that run already counted as a
+# post, and this is the same message finally reaching the channel.
+if [ -n "$use_previous" ]; then
+  previous=$(latest_history)
+  if [ -z "$previous" ] || [ ! -r "$previous" ]; then
+    echo "No saved message to reuse in $history_dir." >&2
+    exit 1
+  fi
+
+  echo "Reusing the message from $(history_date "$previous")." >&2
+  previous_message=$(cat "$previous")
+  printf '%s\n' "$previous_message"
+  copy_to_clipboard "$previous_message"
+  exit 0
 fi
 
 # --- Who are we asking about? ----------------------------------------------
@@ -181,12 +234,6 @@ mentions_of() {
   grep -lE "${escaped}([^0-9]|\$)" "$history_dir"/*"$history_ext" 2>/dev/null | sort
 }
 
-# The most recently written history file, or nothing on a first run. The
-# timestamp format sorts chronologically, so plain lexical order is enough.
-latest_history() {
-  ls -1 "$history_dir"/*"$history_ext" 2>/dev/null | sort | tail -n 1
-}
-
 # Strip the posted count so two messages can be compared on their substance.
 #
 # The count is guaranteed to differ between consecutive runs - the first
@@ -195,18 +242,6 @@ latest_history() {
 # case this is meant to catch.
 without_counts() {
   sed 's/ - Posted here [0-9][0-9]* times*$//'
-}
-
-# 2026-08-31-142530.txt -> 2026-08-31 14:25. Read from the name rather than the
-# mtime so that copying or restoring the directory does not rewrite history.
-history_date() {
-  local base
-  base=$(basename "$1" "$history_ext")
-  if [[ "$base" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{2})([0-9]{2})[0-9]{2}$ ]]; then
-    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
-  else
-    echo "$base"
-  fi
 }
 
 # Fetch one MR's notes into $notes_json. Both the ready date and the comment
@@ -422,10 +457,7 @@ fi
 
 printf '%s\n' "$message"
 
-if [ -n "$copy" ] && command -v pbcopy >/dev/null 2>&1; then
-  printf '%s\n' "$message" | pbcopy
-  echo "Copied to clipboard." >&2
-fi
+copy_to_clipboard "$message"
 
 report_approved
 

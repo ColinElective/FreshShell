@@ -39,7 +39,14 @@ inside a GitLab repo:
 ```sh
 mrpost            # print the message and copy it to the clipboard
 mrpost --no-copy  # print it without touching the clipboard
+mrpost --prev     # re-copy the last saved message, no GitLab calls
 ```
+
+`--prev` (or `-p`) is for when you generated a message and then forgot to
+actually post it: it reprints the most recent saved copy and puts it back on
+the clipboard. It touches nothing on GitLab — it doesn't even need `glab`
+installed — and records nothing new, since that run already counted as a post
+and this is the same message finally reaching the channel.
 
 While it works it shows a single self-overwriting progress line on stderr
 (`Fetching MR 1464... (3 of 5)`), so a slow run doesn't look hung. It's
