@@ -76,6 +76,31 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Colors are empty unless stderr is a terminal, so every call site stays the
+# same shape and the codes simply vanish when output is redirected or piped.
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  clr_cyan=$'\033[36m'
+  clr_dim=$'\033[2m'
+  clr_yellow=$'\033[33m'
+  clr_red=$'\033[31m'
+  clr_reset=$'\033[0m'
+else
+  clr_cyan="" clr_dim="" clr_yellow="" clr_red="" clr_reset=""
+fi
+
+# One line of colored text on stderr. printf, not echo: the text is data and
+# belongs in an argument, never in the format string.
+line_in() {
+  local color="$1"
+  shift
+  printf '%s%s%s\n' "$color" "$*" "$clr_reset" >&2
+}
+
+line_cyan()   { line_in "$clr_cyan"   "$@"; }
+line_dim()    { line_in "$clr_dim"    "$@"; }
+line_yellow() { line_in "$clr_yellow" "$@"; }
+line_red()    { line_in "$clr_red"    "$@"; }
+
 # Progress notices go to stderr, and only to a terminal: stdout has to stay
 # clean for a pipe, and a log file should not collect half-drawn lines. Each
 # notice overwrites the one before it and the last is erased, so the finished
@@ -113,7 +138,8 @@ copy_to_clipboard() {
   [ -n "$copy" ] || return 0
   command -v pbcopy >/dev/null 2>&1 || return 0
   printf '%s\n' "$1" | pbcopy
-  echo "\nCopied to clipboard." >&2
+  echo >&2
+  line_cyan "Copied to clipboard."
 }
 
 # --prev only reads a file back, so it needs neither of these.
