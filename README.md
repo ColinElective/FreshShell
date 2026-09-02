@@ -52,8 +52,8 @@ While it works it shows a single self-overwriting progress line on stderr
 (`Fetching MR 1464... (3 of 5)`), so a slow run doesn't look hung. It's
 suppressed when stderr isn't a terminal, so pipes and logs stay clean.
 
-It lists your open, non-draft merge requests via `glab`, oldest first, so the
-ones that have been waiting longest lead the message:
+It lists your open, non-draft merge requests, oldest first, so the ones that
+have been waiting longest lead the message:
 
 ```
 !401 — Bump node to 22
@@ -171,6 +171,22 @@ Three kinds of note are ignored, or the prompt would fire on nearly every MR:
 
 `MRPOST_AUTHOR` overrides the GitLab username, which otherwise comes from
 whoever `glab` is logged in as.
+
+### One request, not 2N+1
+
+Everything — the MR list, each MR's approvals, and each MR's full note history —
+arrives in a single GraphQL query via `glab api graphql`. The REST equivalent
+needed one list call plus two per MR: on a 12-MR list that was 25 round trips
+taking ~14s, against ~2s now.
+
+The project is derived from your `origin` remote rather than looked up, so that
+stays one request. Set `MRPOST_AUTHOR` and it really is one: otherwise there is
+a second small call to ask `glab` who you are.
+
+Two limits are worth knowing, both currently far out of reach: the query asks
+for the first 100 MRs, and the first 100 notes on each. An MR with more than
+100 notes could in principle have an early draft/ready flip fall outside the
+window, which would date it from when it was opened instead.
 
 ## Notes
 

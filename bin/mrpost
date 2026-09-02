@@ -59,7 +59,6 @@ ignore_commenters="${MRPOST_IGNORE_COMMENTERS-ghost1}"
 # filtered by username. It signs the body with this HTML marker, which is a
 # surer match than the visible text - that can be reworded, the marker cannot.
 notice_marker="${MRPOST_NOTICE_MARKER-NX_CLOUD_APP_COMMENT_END}"
-notes_json=""
 history_dir="${MRPOST_DIR:-}"
 history_ext=".txt"
 
@@ -194,28 +193,90 @@ if [ -z "$author" ]; then
   exit 1
 fi
 
-# --- Fetch the MRs ----------------------------------------------------------
-progress "Fetching list of MRs..."
-mrs_json=$(glab mr list --author="$author" --not-draft --per-page 100 --output json 2>/dev/null)
-progress_clear
-if [ -z "$mrs_json" ] || ! jq -e 'type == "array"' <<<"$mrs_json" >/dev/null 2>&1; then
-  echo "Could not list merge requests for '$author' in this repo." >&2
+# --- Fetch everything -------------------------------------------------------
+# One GraphQL request carries the whole job: every open non-draft MR of yours,
+# each with its approvals and its full note list. The REST version needed a
+# list call plus two calls per MR, so this is 2N+1 round trips collapsed to 1.
+#
+# The project path is derived from the git remote rather than looked up, so
+# that stays true - both the SSH and HTTPS remote forms reduce to group/repo.
+project_path=$(git remote get-url origin 2>/dev/null \
+  | sed -e 's#^git@[^:]*:##' -e 's#^https\{0,1\}://[^/]*/##' -e 's#\.git$##')
+if [ -z "$project_path" ]; then
+  echo "Could not work out the GitLab project from the 'origin' remote." >&2
   exit 1
 fi
 
-# Oldest first: the ones that have been waiting longest lead the message.
-# --not-draft is re-checked here because the flag only filters server-side.
-rows=$(jq -r '
-  map(select(.draft != true and .state == "opened"))
-  | sort_by(.created_at)
+progress "Fetching MRs..."
+graph_json=$(glab api graphql -f query="
+{
+  project(fullPath: \"$project_path\") {
+    mergeRequests(authorUsername: \"$author\", state: opened, draft: false, first: 100) {
+      nodes {
+        iid title webUrl createdAt draft
+        approvedBy { nodes { username } }
+        notes(first: 100) { nodes { body system createdAt author { username } } }
+      }
+    }
+  }
+}" 2>/dev/null)
+progress_clear
+
+if ! jq -e '.data.project.mergeRequests.nodes | type == "array"' <<<"${graph_json:-null}" >/dev/null 2>&1; then
+  echo "Could not fetch merge requests for '$author' in $project_path." >&2
+  jq -r '.errors[]?.message | "  " + .' <<<"${graph_json:-null}" 2>/dev/null >&2
+  exit 1
+fi
+
+# Everything the loop needs, derived in a single pass: when each MR became
+# reviewable, who approved it, and who left a real review comment. Doing it
+# here rather than per-MR means the loop makes no calls of its own at all.
+#
+# Ordered by ready date, so whatever has been waiting longest leads the message.
+rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
+              --arg marker "$notice_marker" '
+  def names($who):
+    ($who | unique | map("@" + .)) as $n
+    | if ($n | length) <= 3 then ($n | join(", "))
+      else (($n[0:2] | join(", ")) + " and \(($n | length) - 2) others") end;
+
+  ($ignore | split(",") | map(select(length > 0))) as $bots
+  | .data.project.mergeRequests.nodes
+  | map(select(.draft != true))
+  | map(. as $mr | {
+      iid: $mr.iid, title: $mr.title, webUrl: $mr.webUrl,
+
+      # The draft/ready flip is a system note. Newest wins - an MR can be
+      # flipped more than once - and one opened ready has no such note at all,
+      # so its creation date is when it became reviewable. Anchored, because
+      # an unanchored "ready" also matches "already" in a commit-list note.
+      ready: ([ $mr.notes.nodes[]?
+                | select(.system == true)
+                | select(.body | test("^marked this merge request as \\*\\*ready\\*\\*$|^unmarked as a work in progress"; "i"))
+                | .createdAt ] | sort | last // $mr.createdAt),
+
+      approvers: [ $mr.approvedBy.nodes[]?.username ],
+
+      # What counts as someone having actually reviewed it: not system notes,
+      # not the Nx Cloud summary (found by the marker it signs its body with),
+      # not the integration accounts, and not your own comments.
+      commenters: [ $mr.notes.nodes[]?
+                    | select(.system != true)
+                    | select(($marker == "") or (((.body // "") | contains($marker)) | not))
+                    | .author.username
+                    | . as $u
+                    | select($u != $author and (($bots | index($u)) == null)) ]
+    })
+  | sort_by(.ready)
   | .[]
-  | [(.iid|tostring), .title, .web_url, .created_at,
-     (.project_id|tostring), (.user_notes_count // 0 | tostring)]
+  | [ .iid, .title, .webUrl, .ready,
+      (.approvers | length | tostring), names(.approvers),
+      (.commenters | length | tostring), names(.commenters) ]
   | @tsv
-' <<<"$mrs_json")
+' <<<"$graph_json")
 
 if [ -z "$rows" ]; then
-  echo "No open, non-draft merge requests authored by $author in this repo." >&2
+  echo "No open, non-draft merge requests authored by $author in $project_path." >&2
   exit 0
 fi
 
@@ -270,95 +331,6 @@ without_counts() {
   sed 's/ - Posted here [0-9][0-9]* times*$//'
 }
 
-# Fetch one MR's notes into $notes_json. Both the ready date and the comment
-# check read them, so they are fetched once and shared rather than twice.
-fetch_notes() {
-  notes_json=$(glab api "projects/$1/merge_requests/$2/notes?per_page=100" 2>/dev/null)
-  jq -e 'type == "array"' <<<"${notes_json:-null}" >/dev/null 2>&1 && return 0
-  notes_json=""
-  return 1
-}
-
-# When the MR became reviewable, falling back to the given creation date.
-#
-# GitLab records the draft/ready flip as a system note. An MR can be flipped
-# more than once, so the newest note wins; an MR opened ready has no such note
-# at all, and for that one the creation date *is* the ready date.
-#
-# The body is anchored rather than searched: an unanchored "ready" also matches
-# the word "already" in an ordinary commit-list note.
-ready_since() {
-  local fallback="$1"
-  [ -n "$notes_json" ] || { echo "$fallback"; return 0; }
-
-  jq -r --arg fallback "$fallback" '
-    [ .[]?
-      | select(.system == true)
-      | select(.body | test("^marked this merge request as \\*\\*ready\\*\\*$|^unmarked as a work in progress"; "i"))
-      | .created_at
-    ] | sort | last // $fallback
-  ' <<<"$notes_json"
-}
-
-# Human review comments on one MR, printed as "count<TAB>@name, @name".
-#
-# Four kinds of note are dropped here, each for its own reason:
-#   - system notes are activity, not review. Note that "approved this merge
-#     request" is one of them, so an approval on its own does not count as a
-#     comment - approvals are handled separately, before this is ever called;
-#   - the integration accounts (CodeRabbit, Linear) comment on very nearly
-#     every MR, so counting them would mean confirming every MR every time;
-#   - the author's own notes are context they added themselves;
-#   - the deploy-preview notice, which posts under a real person's account and
-#     so has to be matched on author and opening text together.
-mr_review_comments() {
-  jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
-        --arg marker "$notice_marker" '
-    ($ignore | split(",") | map(select(length > 0))) as $bots
-    | [ .[]
-        | select(.system != true)
-        # The Nx Cloud CI summary, identified by the marker it signs its body
-        # with rather than by its wording. Matched on the body alone: it posts
-        # under a real account, and that person also leaves genuine reviews.
-        | select(($marker == "") or (((.body // "") | contains($marker)) | not))
-        | .author.username
-        | . as $u
-        | select($u != $author and (($bots | index($u)) == null))
-      ] as $who
-    | ($who | unique | map("@" + .)) as $names
-    | "\($who | length)\t\(
-        if ($names | length) <= 3
-        then $names | join(", ")
-        else ($names[0:2] | join(", ")) + " and \(($names | length) - 2) others"
-        end
-      )"
-  ' <<<"$notes_json"
-}
-
-# Who has approved one MR, printed as "count<TAB>@name, @name".
-#
-# Any approval at all counts. Deliberately not `approvals_left == 0`: a project
-# that requires no approvals reports zero left from the moment it opens, which
-# would drop every MR before anyone had looked at it.
-mr_approvals() {
-  local project_id="$1" iid="$2"
-  local approvals
-
-  approvals=$(glab api "projects/${project_id}/merge_requests/${iid}/approvals" 2>/dev/null)
-  jq -e 'type == "object"' <<<"${approvals:-null}" >/dev/null 2>&1 || return 1
-
-  jq -r '
-    [ .approved_by[]? | .user.username | select(. != null) ] as $who
-    | ($who | unique | map("@" + .)) as $names
-    | "\($who | length)\t\(
-        if ($names | length) <= 3
-        then $names | join(", ")
-        else ($names[0:2] | join(", ")) + " and \(($names | length) - 2) others"
-        end
-      )"
-  ' <<<"$approvals"
-}
-
 # Ask whether an MR that already has review comments should still be chased.
 #
 # The prompt goes to stderr and the answer is read from the terminal rather
@@ -391,46 +363,19 @@ message=""
 approved_list=""
 approved_count=0
 
-mr_total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
-mr_index=0
-
-while IFS=$'\t' read -r iid title web_url created_at project_id notes_count; do
+while IFS=$'\t' read -r iid title web_url ready_at approval_count approvers comment_count commenters; do
   [ -n "$iid" ] || continue
-  mr_index=$(( mr_index + 1 ))
-  progress "Fetching MR ${iid}... (${mr_index} of ${mr_total})"
 
-  # An approval is the clearest possible sign the MR has had its review, so it
-  # is dropped outright rather than prompted about. Checked before comments so
-  # an approved MR never asks a question it already has the answer to.
-  if approvals=$(mr_approvals "$project_id" "$iid"); then
-    IFS=$'\t' read -r approval_count approvers <<<"$approvals"
-    if [ "${approval_count:-0}" -gt 0 ]; then
-      approved_list+="  !${iid} approved by ${approvers} ${web_url}"$'\n'
-      approved_count=$(( approved_count + 1 ))
-      continue
-    fi
-  else
-    progress_clear
-    echo "Could not read approvals for !${iid}; treating it as unapproved." >&2
+  # An approval is the clearest sign the MR has had its review, so it is
+  # dropped outright rather than prompted about.
+  if [ "${approval_count:-0}" -gt 0 ]; then
+    approved_list+="  !${iid} approved by ${approvers} ${web_url}"$'\n'
+    approved_count=$(( approved_count + 1 ))
+    continue
   fi
 
-  # Fetched unconditionally now: the draft/ready flip is a *system* note, which
-  # user_notes_count does not count, so a comment-free MR can still have one.
-  if ! fetch_notes "$project_id" "$iid"; then
-    progress_clear
-    echo "Could not read notes for !${iid}; dating it from when it was opened." >&2
-  fi
-
-  ready_at=$(ready_since "$created_at")
-
-  # user_notes_count excludes system notes, so zero means there is no human
-  # comment to weigh up and the prompt can be skipped.
-  if [ -z "$assume_yes" ] && [ -n "$notes_json" ] && [ "${notes_count:-0}" -gt 0 ]; then
-    comments=$(mr_review_comments)
-    IFS=$'\t' read -r comment_count commenters <<<"$comments"
-    if [ "${comment_count:-0}" -gt 0 ]; then
-      confirm_post "$iid" "$web_url" "$comment_count" "$commenters" || continue
-    fi
+  if [ -z "$assume_yes" ] && [ "${comment_count:-0}" -gt 0 ]; then
+    confirm_post "$iid" "$web_url" "$comment_count" "$commenters" || continue
   fi
 
   secs=$(age_seconds "$ready_at")
