@@ -233,6 +233,13 @@ fi
 # here rather than per-MR means the loop makes no calls of its own at all.
 #
 # Ordered by ready date, so whatever has been waiting longest leads the message.
+#
+# Fields are separated by 0x1F rather than by the tab @tsv emits. Tab is an IFS
+# *whitespace* character, so `read` folds a run of them into one delimiter and
+# an empty field silently vanishes, shifting every later column left. An MR
+# with no approvals but real comments hit exactly that. 0x1F is not whitespace,
+# so empty fields survive; @tsv has already escaped any literal tab or newline
+# in the data, which is what makes the translation safe.
 rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
               --arg marker "$notice_marker" '
   def names($who):
@@ -273,7 +280,7 @@ rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
       (.approvers | length | tostring), names(.approvers),
       (.commenters | length | tostring), names(.commenters) ]
   | @tsv
-' <<<"$graph_json")
+' <<<"$graph_json" | tr '\t' '\037')
 
 if [ -z "$rows" ]; then
   echo "No open, non-draft merge requests authored by $author in $project_path." >&2
@@ -363,7 +370,7 @@ message=""
 approved_list=""
 approved_count=0
 
-while IFS=$'\t' read -r iid title web_url ready_at approval_count approvers comment_count commenters; do
+while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers comment_count commenters; do
   [ -n "$iid" ] || continue
 
   # An approval is the clearest sign the MR has had its review, so it is
