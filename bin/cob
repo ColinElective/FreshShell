@@ -55,6 +55,28 @@ worktree_admin_dir() {
   done
 }
 
+# Spin while $1 (a pid) runs, then hand back its exit status so callers can
+# still branch on whether it worked.
+#
+# A monorepo worktree is nearly all node_modules - a couple of hundred thousand
+# files, each its own unlink - so a removal runs long enough with no output to
+# look like a hang. There has to be something moving on screen.
+spin_while() {
+  local pid="$1" msg="$2"
+  local frames='|/-\' i=0 start=$SECONDS
+
+  # Only animate on a terminal; a log file should not collect spinner frames.
+  if [ ! -t 2 ]; then wait "$pid"; return $?; fi
+
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i + 1) % 4 ))
+    printf '\r\033[K%s %s (%ss)' "${frames:$i:1}" "$msg" "$(( SECONDS - start ))" >&2
+    sleep 0.2
+  done
+  printf '\r\033[K' >&2
+  wait "$pid"
+}
+
 branch_names=()
 matches=()
 
@@ -131,12 +153,22 @@ if [ "$checkout_status" -ne 0 ] && [ -n "$prune_worktree" ] \
     y|Y|yes|Yes|YES)
       # Two --force flags on purpose: the first accepts a dirty worktree, the
       # second overrides a lock. A single one fails on a locked worktree.
-      if ! git worktree remove --force --force "$worktree_path" 2>/dev/null; then
+      #
+      # Backgrounded so the spinner can report that the delete is still going;
+      # spin_while passes the exit status through, so the fallback below still
+      # triggers on exactly the same condition it always did.
+      git worktree remove --force --force "$worktree_path" 2>/dev/null &
+      if ! spin_while $! "Removing worktree"; then
         # Fallback for a worktree git can no longer match - usually the directory
         # was already deleted by hand. `git worktree prune` skips locked entries,
         # so the lock file has to go first or the registration survives and the
         # branch stays "already used by worktree at ...".
-        rm -rf "$worktree_path"
+        # stderr suppressed to match the removal above, and because rm writes
+        # asynchronously: unredirected, its errors interleave with the spinner
+        # and shred both. A genuinely undeletable tree still surfaces, as the
+        # retried checkout below fails on the same collision.
+        rm -rf "$worktree_path" 2>/dev/null &
+        spin_while $! "Deleting files"
         if [ -n "$admin_dir" ]; then
           rm -f "$admin_dir/locked"
         fi
