@@ -136,6 +136,42 @@ The test is `approved_by` being non-empty, deliberately not `approvals_left ==
 0` — a project that requires no approvals reports zero left from the moment an
 MR opens, which would drop everything before anyone had looked at it.
 
+### Reset approvals
+
+An MR that *was* approved but has no approvals now — a push reset them, or the
+approver revoked — stays in the message, asking for a second look:
+
+```
+!1523 — Fix the thing
+https://gitlab.com/.../1523
+Ready for re-review 2 hours ago (last approved 5 days ago)
+```
+
+"Last approved" is the newest *approved this merge request* note. The re-review
+age counts from the first push, revoke or reset note after it, and the MR is
+sorted by that date rather than by when it first went ready. The reset is
+detected from the approval going missing rather than from GitLab's reset note,
+since not every GitLab version writes one.
+
+### Merge conflicts
+
+An MR that won't merge can't be usefully reviewed, so any with `conflicts: true`
+is dropped from the message and listed on stderr afterwards:
+
+```
+Skipped 2 MRs with merge conflicts:
+  !1523 https://gitlab.com/.../1523
+  !1524 https://gitlab.com/.../1524
+```
+
+Checked *before* approvals, so an approved MR that has since gone stale is
+reported as needing a rebase rather than filed under "already done".
+
+One limit: GitLab computes mergeability lazily, and an MR it hasn't got to yet
+reports `UNCHECKED` with `conflicts: false`. Such an MR stays in the message
+even if it would in fact conflict — the error falls on the side of nagging
+about one too many rather than silently dropping one.
+
 ### Review-comment check
 
 Before an MR goes into the message, `mrpost` checks it for review comments —
@@ -183,10 +219,14 @@ The project is derived from your `origin` remote rather than looked up, so that
 stays one request. Set `MRPOST_AUTHOR` and it really is one: otherwise there is
 a second small call to ask `glab` who you are.
 
-Two limits are worth knowing, both currently far out of reach: the query asks
-for the first 100 MRs, and the first 100 notes on each. An MR with more than
-100 notes could in principle have an early draft/ready flip fall outside the
-window, which would date it from when it was opened instead.
+Notes come 100 to a page. An MR with more is paged through afterwards, one
+extra request per extra page, so its ready date, approvals and review comments
+are read from the full history — only the rare long MR costs anything. If one
+of those follow-up requests fails, `mrpost` warns that the MR's notes may be
+incomplete and carries on with what it has.
+
+The MR list itself is not paged: the query asks for the first 100 of your open
+MRs, which is far out of reach.
 
 ## Notes
 

@@ -213,9 +213,12 @@ graph_json=$(glab api graphql -f query="
   project(fullPath: \"$project_path\") {
     mergeRequests(authorUsername: \"$author\", state: opened, draft: false, first: 100) {
       nodes {
-        iid title webUrl createdAt draft
+        iid title webUrl createdAt draft conflicts
         approvedBy { nodes { username } }
-        notes(first: 100) { nodes { body system createdAt author { username } } }
+        notes(first: 100) {
+          pageInfo { hasNextPage endCursor }
+          nodes { body system createdAt author { username } }
+        }
       }
     }
   }
@@ -227,6 +230,57 @@ if ! jq -e '.data.project.mergeRequests.nodes | type == "array"' <<<"${graph_jso
   jq -r '.errors[]?.message | "  " + .' <<<"${graph_json:-null}" 2>/dev/null >&2
   exit 1
 fi
+
+# --- Fetch the rest of any long note list -----------------------------------
+# Notes come 100 to a page, and everything below reads them: the ready date,
+# the approval and its reset, the review comments. A busy MR can outgrow one
+# page, so any MR with more is paged through here, one request per extra page,
+# and the notes folded into graph_json as if the first request had got them.
+# Only the rare long MR pays for this.
+#
+# The page is handed to jq through a file rather than an argument: a hundred
+# notes, CI summaries among them, can run past the argument length limit.
+fetch_remaining_notes() {
+  local iid="$1" cursor="$2" page
+
+  while [ -n "$cursor" ]; do
+    progress "Fetching more notes for !${iid}..."
+    page=$(glab api graphql -f query="
+{
+  project(fullPath: \"$project_path\") {
+    mergeRequest(iid: \"$iid\") {
+      notes(first: 100, after: \"$cursor\") {
+        pageInfo { hasNextPage endCursor }
+        nodes { body system createdAt author { username } }
+      }
+    }
+  }
+}" 2>/dev/null)
+
+    if ! jq -e '.data.project.mergeRequest.notes.nodes | type == "array"' <<<"${page:-null}" >/dev/null 2>&1; then
+      progress_clear
+      line_yellow "Could not fetch every note for !${iid} - its review comments and approvals may be incomplete."
+      return 1
+    fi
+
+    graph_json=$(jq --arg iid "$iid" --slurpfile page <(printf '%s' "$page") '
+      $page[0].data.project.mergeRequest.notes as $more
+      | .data.project.mergeRequests.nodes |= map(
+          if .iid == $iid then .notes.nodes += $more.nodes else . end)
+    ' <<<"$graph_json")
+
+    cursor=$(jq -r '.data.project.mergeRequest.notes.pageInfo
+                    | if .hasNextPage then .endCursor else empty end' <<<"$page")
+  done
+  progress_clear
+}
+
+while IFS=$'\t' read -r iid cursor; do
+  [ -n "$iid" ] || continue
+  fetch_remaining_notes "$iid" "$cursor"
+done < <(jq -r '.data.project.mergeRequests.nodes[]
+                | select(.notes.pageInfo.hasNextPage == true)
+                | [.iid, .notes.pageInfo.endCursor] | @tsv' <<<"$graph_json")
 
 # Everything the loop needs, derived in a single pass: when each MR became
 # reviewable, who approved it, and who left a real review comment. Doing it
@@ -250,8 +304,29 @@ rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
   ($ignore | split(",") | map(select(length > 0))) as $bots
   | .data.project.mergeRequests.nodes
   | map(select(.draft != true))
-  | map(. as $mr | {
+  | map(. as $mr
+    | [ $mr.notes.nodes[]? | select(.system == true) ] as $sys
+
+    # The newest approval on record, whether or not it still stands.
+    | ([ $sys[] | select(.body | test("^approved this merge request"; "i"))
+                | .createdAt ] | sort | last) as $approved
+
+    | {
       iid: $mr.iid, title: $mr.title, webUrl: $mr.webUrl,
+      conflicts: $mr.conflicts,
+      approved_at: ($approved // ""),
+
+      # Approved once but approved by nobody now: a push reset it, or the
+      # approver took it back. Either way it wants another look, from the first
+      # thing after that approval that could have cleared it. Worked out from
+      # the approval going missing rather than from the reset note, which not
+      # every GitLab version writes. If nothing matches, the approval itself is
+      # the best date there is.
+      reset_at: (if $approved != null and ($mr.approvedBy.nodes | length) == 0 then
+                   ([ $sys[] | select(.createdAt > $approved)
+                             | select(.body | test("^added [0-9]+ commits?|^unapproved this merge request|^reset approvals"; "i"))
+                             | .createdAt ] | sort | first // $approved)
+                 else "" end),
 
       # The draft/ready flip is a system note. Newest wins - an MR can be
       # flipped more than once - and one opened ready has no such note at all,
@@ -274,11 +349,16 @@ rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
                     | . as $u
                     | select($u != $author and (($bots | index($u)) == null)) ]
     })
-  | sort_by(.ready)
+
+  # A reset MR has been waiting since the reset, not since it first went
+  # ready - unless it went back to draft and was readied again after that.
+  | map(.since = ([.ready, .reset_at] | max))
+  | sort_by(.since)
   | .[]
-  | [ .iid, .title, .webUrl, .ready,
+  | [ .iid, .title, .webUrl, .since,
       (.approvers | length | tostring), names(.approvers),
-      (.commenters | length | tostring), names(.commenters) ]
+      (.commenters | length | tostring), names(.commenters),
+      (.conflicts | tostring), .reset_at, .approved_at ]
   | @tsv
 ' <<<"$graph_json" | tr '\t' '\037')
 
@@ -369,9 +449,21 @@ confirm_post() {
 message=""
 approved_list=""
 approved_count=0
+conflicted_list=""
+conflicted_count=0
 
-while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers comment_count commenters; do
+while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers comment_count commenters conflicts reset_at approved_at; do
   [ -n "$iid" ] || continue
+
+  # Nobody can review what will not merge, so a conflicted MR is dropped and
+  # reported instead. Checked before approvals on purpose: an approved MR that
+  # has since gone stale needs a rebase, and saying so is more use than filing
+  # it under "already done".
+  if [ "$conflicts" = "true" ]; then
+    conflicted_list+="  !${iid} ${web_url}"$'\n'
+    conflicted_count=$(( conflicted_count + 1 ))
+    continue
+  fi
 
   # An approval is the clearest sign the MR has had its review, so it is
   # dropped outright rather than prompted about.
@@ -385,11 +477,29 @@ while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers co
     confirm_post "$iid" "$web_url" "$comment_count" "$commenters" || continue
   fi
 
+  # An MR whose approval was reset has had one review already, so the channel
+  # is asked for a second look rather than a first, with the date of the
+  # approval that was lost.
+  if [ -n "$reset_at" ]; then
+    status="Ready for re-review"
+  else
+    status="Ready for review"
+  fi
+
   secs=$(age_seconds "$ready_at")
   if [ -n "$secs" ]; then
-    detail="Ready for review $(human_age "$secs") ago"
+    detail="$status $(human_age "$secs") ago"
   else
-    detail="Ready for review $ready_at"
+    detail="$status $ready_at"
+  fi
+
+  if [ -n "$reset_at" ]; then
+    approved_secs=$(age_seconds "$approved_at")
+    if [ -n "$approved_secs" ]; then
+      detail="$detail (last approved $(human_age "$approved_secs") ago)"
+    else
+      detail="$detail (last approved $approved_at)"
+    fi
   fi
 
   # Opt-in: naming the count in the channel is a pointed thing to do, so it is
@@ -425,11 +535,21 @@ report_approved() {
   printf '%s' "$approved_list" >&2
 }
 
+# Reported after the approvals, so the MRs that need work from you are the
+# last thing on screen.
+report_conflicted() {
+  [ "$conflicted_count" -gt 0 ] || return 0
+  echo >&2
+  echo "Skipped $(plural "$conflicted_count" "MR") with merge conflicts:" >&2
+  printf '%s' "$conflicted_list" >&2
+}
+
 # Everything was declined - say so rather than emitting a blank message and
 # recording it as a post that went to the channel.
 if [ -z "$message" ]; then
   echo "Nothing to post." >&2
   report_approved
+  report_conflicted
   exit 0
 fi
 
@@ -438,6 +558,7 @@ printf '%s\n' "$message"
 copy_to_clipboard "$message"
 
 report_approved
+report_conflicted
 
 # --- Record this run --------------------------------------------------------
 # Last, so the counts above reflect only earlier messages. A directory that
