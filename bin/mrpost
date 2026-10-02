@@ -552,40 +552,48 @@ if [ -n "$stats_mode" ]; then
     # A round still open on a merged or closed MR ended there, unreviewed.
     # Both are timed from the ask to that end.
     | def nudges($asks): ($asks | length) - 1 | if . > 0 then " (\(plural(.; "nudge")))" else "" end;
+      # Every round line ends with what it adds to the wait figures: its wait
+      # when it is one of their data points, or why it is left out.
+      def counted($secs): " [+\(business_span($secs))]";
       def round_lines($m; $c):
         [ $c.rounds | to_entries[]
           | "  Round \(.key + 1): asked \(.value.asked | time_label)\(nudges(.value.asks)), "
             + (if .value.what == "draft" then "marked draft "
                else "\(.value.what | if . == "approval" then "approved" else "reviewed" end) by @\(.value.by) " end)
-            + "\(.value.reviewed | time_label) after \(business_span(.value.wait))" ]
+            + "\(.value.reviewed | time_label) after \(business_span(.value.wait))"
+            + counted(.value.wait) ]
         + (if $c.open == null then []
            else [ "  Round \(($c.rounds | length) + 1): asked \($c.open.asked | time_label)\(nudges($c.open.asks)), "
                   + (if $m.state == "merged" then
                        "merged \($m.mergedAt | epoch | time_label) without a review, after \(business_span(business_secs($c.open.asked; $m.mergedAt | epoch)))"
+                       + " [not counted: merged unreviewed]"
                      elif $m.state == "closed" then
-                       "closed \($m.closedAt | epoch | time_label) without a review, after \(business_span(business_secs($c.open.asked; $m.closedAt | epoch)))"
-                     else "waiting \(business_span($c.open.wait)) so far" end) ]
+                       (business_secs($c.open.asked; $m.closedAt | epoch)) as $w
+                       | "closed \($m.closedAt | epoch | time_label) without a review, after \(business_span($w))" + counted($w)
+                     else "waiting \(business_span($c.open.wait)) so far" + counted($c.open.wait) end) ]
            end);
 
-    # A round ended by going back to draft was real waiting, but it never got
-    # a review, so it stays out of the review-wait figures. A round the MR was
-    # closed on, unreviewed, stays in: the wait ran until the close, and
-    # leaving abandoned MRs out would flatter the median.
+    # Every wait the reviewers had counts, however it ended: a review, a
+    # return to draft, a close, or not yet - an open round counts up to now.
+    # Leaving any of those out would flatter the figures. Only a round that
+    # ended in a merge without a review is left out. The figures use exact
+    # seconds; only the labels are rounded down.
     [ $all[] | .mr.iid as $iid | .c.rounds[] | select(.what != "draft") | {wait, iid: $iid} ] as $reviewed
+    | [ $all[] | .mr.iid as $iid | .c.rounds[] | select(.what == "draft") | {wait, iid: $iid} ] as $drafted
     | [ $all[] | select(.mr.state == "closed" and .c.open != null and .mr.closedAt != null)
         | {wait: business_secs(.c.open.asked; .mr.closedAt | epoch), iid: .mr.iid} ] as $closed
-    | ([ $all[] | .c.rounds[] | select(.what == "draft") ] | length) as $drafted
-    | ($reviewed + $closed | sort_by(.wait)) as $sorted
-    | ([ $all[] | select(.c.open != null and .mr.state == "opened") ] | length) as $waiting
+    | [ $all[] | select(.mr.state == "opened" and .c.open != null)
+        | {wait: .c.open.wait, iid: .mr.iid} ] as $waiting
+    | ($reviewed + $drafted + $closed + $waiting | sort_by(.wait)) as $sorted
 
     | ([ $all[]
          | "!\(.mr.iid) \(.mr.title) (\(.mr.state | if . == "opened" then "open" else . end))",
            (round_lines(.mr; .c)[]),
            "" ]
        + [ "\($all | length) MRs asked about since \($since), \([ $all[] | (.c.rounds[].asks | length), (.c.open.asks // [] | length) ] | add) asks, "
-           + "\($reviewed | length) rounds reviewed, \($closed | length) closed unreviewed, \($drafted) ended by going to draft, \($waiting) still waiting" ]
+           + "\($reviewed | length) rounds reviewed, \($closed | length) closed unreviewed, \($drafted | length) ended by going to draft, \($waiting | length) still waiting" ]
        + (if ($sorted | length) == 0 then []
-          else [ "Wait per reviewed or closed round: median \(business_span($sorted[($sorted | length) / 2 | floor].wait)), "
+          else [ "Wait per round: median \(business_span($sorted[($sorted | length) / 2 | floor].wait)), "
                  + "longest \(business_span($sorted[-1].wait)) (!\($sorted[-1].iid))" ]
           end))
     | .[]
