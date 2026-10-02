@@ -2,16 +2,24 @@
 #
 # mrpost - build the code-review message for the review channel.
 #
-# Lists your open, non-draft merge requests in the current repo via glab, aged
-# from when each became reviewable rather than when it was opened,
-# oldest first, and prints them as plain text ready to paste. No markup: the
-# chat composer does not interpret it, so asterisks would show up literally.
+# Lists your open, non-draft merge requests in the current repo via glab and
+# prints them as plain text ready to paste. No markup: the chat composer does
+# not interpret it, so asterisks would show up literally.
 #
-# Every generated message is also saved to $MRPOST_DIR, which defaults to
-# .mrpost at the repository root.
-# Those saved copies are the record of what has already been posted: each run
-# is assumed to end up in the channel, so one history file is one post. That
-# is what lets a later run say how many times an MR has been chased already.
+# Slack is the record of when review was asked for. Every message of yours in
+# the review channel that links an MR counts as one ask for it, whether this
+# script wrote it or you did. Each MR is on a clock that runs on business
+# hours only:
+#
+#   - an ask hands it to the reviewers, and their wait starts;
+#   - a code comment or an approval from someone else hands it back to you;
+#   - an ask while it is already with the reviewers is a nudge, and does not
+#     restart the wait.
+#
+# Pushes and thread replies do not move the clock. A reviewer only learns the
+# MR is ready again when you ask, so until then the time is yours.
+#
+# With --stats it prints a personal report of every round instead.
 
 set -uo pipefail
 
@@ -24,13 +32,12 @@ Usage: mrpost [options]
   -c, --copy               Copy the message to the clipboard (pbcopy). On by
                            default; use --no-copy to turn it off.
       --no-copy            Print the message without touching the clipboard.
-      --pc, --post-count   Add "- Posted here N times" to each MR, counted
-                           from past messages. Off by default.
-  -p, --prev               Reprint the most recent saved message and copy it,
-                           without contacting GitLab at all. For when the last
-                           one was generated but never actually posted.
   -y, --yes                Include every MR without asking, even ones that
                            already have review comments.
+      --stats              Instead of the channel message, print every MR you
+                           asked for review on since --since: each round, how
+                           long it waited, and totals. Never copied.
+      --since <YYYY-MM-DD> Start of the --stats window (default: 30 days ago).
   -h, --help               Show this help.
 
 Environment:
@@ -42,25 +49,43 @@ Environment:
   MRPOST_IGNORE_COMMENTERS Comma-separated usernames whose comments never
                            count as a review (default: ghost1, the account
                            CodeRabbit and Linear post under).
-  MRPOST_DIR               Where to keep past messages (default: .mrpost at
-                           the repository root).
-                           Each run saves a copy there, and every saved copy
-                           counts as one post to the channel.
+  MRPOST_SLACK_CHANNEL     Channel review is asked for in (default:
+                           eng_chat_pull-requests).
+  MRPOST_SLACK_KEYCHAIN    Keychain item holding your Slack user token
+                           (default: mrpost-slack). The token needs the user
+                           scopes search:read, channels:history,
+                           groups:history and users:read. Store it with:
+                             security add-generic-password -a "$USER" -s mrpost-slack -w
+  MRPOST_TZ                Timezone of the 9-17 working day (default:
+                           America/Vancouver).
 USAGE
 }
 
 author=""
 copy="true"
 assume_yes=""
-show_post_count=""
-use_previous=""
+stats_mode=""
+stats_since=""
 ignore_commenters="${MRPOST_IGNORE_COMMENTERS-ghost1}"
 # Nx Cloud posts its CI summary under a real person's account, so it cannot be
 # filtered by username. It signs the body with this HTML marker, which is a
 # surer match than the visible text - that can be reworded, the marker cannot.
 notice_marker="${MRPOST_NOTICE_MARKER-NX_CLOUD_APP_COMMENT_END}"
-history_dir="${MRPOST_DIR:-}"
-history_ext=".txt"
+slack_channel="${MRPOST_SLACK_CHANNEL:-eng_chat_pull-requests}"
+slack_keychain="${MRPOST_SLACK_KEYCHAIN:-mrpost-slack}"
+work_tz="${MRPOST_TZ:-America/Vancouver}"
+
+# BC statutory holidays. A year missing from this list is warned about and
+# counted as if every weekday were a working day, so add each new year before
+# it starts.
+bc_holidays="
+2025-01-01 2025-02-17 2025-04-18 2025-05-19 2025-07-01 2025-08-04
+2025-09-01 2025-09-30 2025-10-13 2025-11-11 2025-12-25
+2026-01-01 2026-02-16 2026-04-03 2026-05-18 2026-07-01 2026-08-03
+2026-09-07 2026-09-30 2026-10-12 2026-11-11 2026-12-25
+2027-01-01 2027-02-15 2027-03-26 2027-05-24 2027-07-01 2027-08-02
+2027-09-06 2027-09-30 2027-10-11 2027-11-11 2027-12-25
+"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,8 +93,10 @@ while [[ $# -gt 0 ]]; do
     -c|--copy)    copy="true"; shift ;;
     --no-copy)    copy=""; shift ;;
     -y|--yes)     assume_yes="true"; shift ;;
-    -pc|--pc|--post-count) show_post_count="true"; shift ;;
-    -p|--prev)    use_previous="true"; shift ;;
+    --stats)      stats_mode="true"; shift ;;
+    --since)
+      [ $# -ge 2 ] || { echo "--since needs a date (YYYY-MM-DD)." >&2; exit 1; }
+      stats_since="$2"; shift 2 ;;
     -h|--help)    usage; exit 0 ;;
     *)            echo "Unexpected argument: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -114,23 +141,7 @@ progress_clear() {
   printf '\r\033[K' >&2
 }
 
-# The most recently written history file, or nothing on a first run. The
-# timestamp format sorts chronologically, so plain lexical order is enough.
-latest_history() {
-  ls -1 "$history_dir"/*"$history_ext" 2>/dev/null | sort | tail -n 1
-}
-
-# 2026-08-31-142530.txt -> 2026-08-31 14:25. Read from the name rather than the
-# mtime so that copying or restoring the directory does not rewrite history.
-history_date() {
-  local base
-  base=$(basename "$1" "$history_ext")
-  if [[ "$base" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{2})([0-9]{2})[0-9]{2}$ ]]; then
-    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
-  else
-    echo "$base"
-  fi
-}
+plural() { [ "$1" -eq 1 ] && echo "$1 $2" || echo "$1 ${2}s"; }
 
 # Deliver the finished message to the clipboard, if that is switched on.
 copy_to_clipboard() {
@@ -141,43 +152,156 @@ copy_to_clipboard() {
   line_cyan "Copied to clipboard."
 }
 
-# --prev only reads a file back, so it needs neither of these.
-if [ -z "$use_previous" ]; then
-  for cmd in glab jq; do
-    command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required but not installed." >&2; exit 1; }
-  done
-fi
+for cmd in glab jq curl security; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required but not installed." >&2; exit 1; }
+done
 
 if ! git rev-parse --is-inside-work-tree &>/dev/null; then
   echo "Not inside a Git repository." >&2
   exit 1
 fi
 
-# Anchor the history to the repo root, not the working directory. Running from
-# the root and from a subdirectory of a monorepo would otherwise build two
-# separate histories that cannot see each other, silently undercounting.
-if [ -z "$history_dir" ]; then
-  history_dir="$(git rev-parse --show-toplevel)/.mrpost"
-fi
-
-# --- Reuse the last message -------------------------------------------------
-# Deliberately before anything that talks to GitLab: the whole point is to
-# recover a message that was generated but never posted, without paying for the
-# lookups again. Nothing is recorded either - that run already counted as a
-# post, and this is the same message finally reaching the channel.
-if [ -n "$use_previous" ]; then
-  previous=$(latest_history)
-  if [ -z "$previous" ] || [ ! -r "$previous" ]; then
-    echo "No saved message to reuse in $history_dir." >&2
+if [ -n "$stats_mode" ]; then
+  if [ -z "$stats_since" ]; then
+    stats_since=$(date -v-30d +%Y-%m-%d)
+  fi
+  if ! [[ "$stats_since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+     || ! date -j -f %Y-%m-%d "$stats_since" +%s >/dev/null 2>&1; then
+    echo "--since must be a date like 2026-09-01, not '$stats_since'." >&2
     exit 1
   fi
-
-  echo "Reusing the message from $(history_date "$previous")." >&2
-  previous_message=$(cat "$previous")
-  printf '%s\n' "$previous_message"
-  copy_to_clipboard "$previous_message"
-  exit 0
 fi
+
+holidays_json=$(jq -cn --arg h "$bc_holidays" '[$h | splits("\\s+") | select(length > 0)]')
+
+# --- Shared jq definitions --------------------------------------------------
+# Every time calculation lives here, so the channel message and --stats can
+# never disagree about how long something waited. Run under TZ=$work_tz: the
+# working day is 9-17 on the local clock, not in UTC.
+jq_lib='
+def epoch: if type == "number" then . else (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) end;
+
+# Seconds since the epoch, shifted so they read as the local wall clock:
+# mktime takes the broken-down local time as if it were UTC. Day boundaries
+# and hours of the day then fall where the working day does.
+def wall: floor | localtime | mktime;
+
+def plural($n; $word): "\($n) \($word)" + (if $n == 1 then "" else "s" end);
+
+def holiday: . as $date | any($holidays[]; . == $date);
+
+# Working seconds between two instants: 9-17, Monday to Friday, holidays
+# excluded. A span starting at 16:00 Friday and ending 10:00 Monday is two
+# hours. Day 0 of the epoch was a Thursday, hence the +4.
+def business_secs($from; $to):
+  if $to <= $from then 0 else
+    ($from | wall) as $a | ($to | wall) as $b
+    | reduce range($a / 86400 | floor; ($b / 86400 | floor) + 1) as $day (0;
+        ($day * 86400) as $midnight
+        | if (($day + 4) % 7) as $wd | $wd == 0 or $wd == 6 then .
+          elif ($midnight | todate[0:10] | holiday) then .
+          else . + ([([$b, $midnight + 61200] | min) - ([$a, $midnight + 32400] | max), 0] | max)
+          end)
+  end;
+
+# Always rounded down, so a wait is never overstated. A business day is one
+# 8-hour working day, not 24 hours.
+def business_span($secs):
+  if $secs < 3600 then "less than a business hour"
+  elif $secs < 28800 then plural($secs / 3600 | floor; "business hour")
+  else plural($secs / 28800 | floor; "business day") end;
+
+def day_label: wall | (strftime("%b ") + (strftime("%d") | tonumber | tostring));
+def time_label: day_label + (wall | strftime(" %H:%M"));
+
+def names($who):
+  ($who | unique | map("@" + .)) as $n
+  | if ($n | length) <= 3 then ($n | join(", "))
+    else (($n[0:2] | join(", ")) + " and \(($n | length) - 2) others") end;
+
+# The review clock for one MR node, from its GitLab notes and the Slack asks
+# that link it. Returns every finished round, the open one if the reviewers
+# have it now, and every review on record.
+#
+# What counts as a review: an approval, or a comment that is not a system
+# note, not the Nx Cloud summary, not from an integration account and not
+# yours. Asks made while the MR was a draft are ignored, since nobody could
+# review it then.
+def clock($asks; $me; $bots; $marker; $now):
+  . as $mr
+  | [ $mr.notes.nodes[]?
+      | .author.username as $u
+      | select($u != $me and (($bots | index($u)) == null))
+      | if .system == true then
+          select(.body | test("^approved this merge request"; "i"))
+          | {t: (.createdAt | epoch), kind: "review", what: "approval", who: .author.username}
+        else
+          select(($marker == "") or (((.body // "") | contains($marker)) | not))
+          | {t: (.createdAt | epoch), kind: "review", what: "review", who: .author.username}
+        end ] as $reviews
+  | [ $mr.notes.nodes[]? | select(.system == true) | .body as $b
+      | if ($b | test("^marked this merge request as \\*\\*draft\\*\\*|^marked as a \\*\\*work in progress\\*\\*"; "i"))
+        then {t: (.createdAt | epoch), kind: "draft"}
+        elif ($b | test("^marked this merge request as \\*\\*ready\\*\\*$|^unmarked as a work in progress"; "i"))
+        then {t: (.createdAt | epoch), kind: "ready"}
+        else empty end ] as $flips
+  | [ $asks[] | select(.iid == $mr.iid) | . + {kind: "ask", t: .ts} ] as $mine
+  | (if ($flips | length) == 0 then ($mr.draft == true)
+     else (($flips | sort_by(.t) | first | .kind) == "ready") end) as $started_draft
+  | reduce (($mine + $reviews + $flips) | sort_by(.t) | .[]) as $e
+      ({draft: $started_draft, open: null, rounds: [], reviews: []};
+       # Going back to draft takes the MR off the reviewers, so it ends their
+       # wait the way a review does. Readying it again starts nothing - the
+       # next ask does.
+       if $e.kind == "draft" then
+         .draft = true
+         | if .open != null then
+             .rounds += [.open + {reviewed: $e.t, by: null, what: "draft",
+                                   wait: business_secs(.open.asked; $e.t)}]
+             | .open = null
+           else . end
+       elif $e.kind == "ready" then .draft = false
+       elif $e.kind == "ask" then
+         if .draft then .
+         elif .open == null then .open = {asked: $e.t, asks: [$e]}
+         else .open.asks += [$e] end
+       else
+         .reviews += [$e]
+         | if .open != null then
+             .rounds += [.open + {reviewed: $e.t, by: $e.who, what: $e.what,
+                                   wait: business_secs(.open.asked; $e.t)}]
+             | .open = null
+           else . end
+       end)
+  | del(.draft)
+  | if .open != null then .open.wait = business_secs(.open.asked; $now) else . end;
+
+def channel_line:
+  . as $c
+  | if $c.open != null then
+      "\(business_span($c.open.wait)) waiting for "
+      + (if any($c.reviews[]; .t < $c.open.asked) then "re-review" else "review" end)
+      + " - asked \(plural($c.open.asks | length; "time")) since \($c.open.asked | day_label)"
+    elif ($c.reviews | length) == 0 then
+      if ($c.rounds | length) == 0 then "Ready for review - first ask" else "Ready for review" end
+    else
+      # The reviewers of the last round that ended in a review, not one that
+      # ended by going back to draft.
+      ([ $c.rounds[] | select(.what != "draft") ] | last | .asked // 0) as $from
+      | ([ $c.reviews[] | select(.t >= $from) ] | if length > 0 then . else [ $c.reviews[-1] ] end) as $last
+      | "Ready for re-review - after "
+        + (if $last[-1].what == "approval" then "approval" else "review" end)
+        + " from \(names([ $last[].who ])) on \($last[-1].t | day_label)"
+    end;
+'
+
+# Run jq with the shared definitions, the working-day timezone and the
+# holiday list. Callers pass their own options and filter as usual.
+jq_clock() {
+  local filter="${*: -1}"
+  local opts=("${@:1:$#-1}")
+  TZ="$work_tz" jq ${opts[@]+"${opts[@]}"} --argjson holidays "$holidays_json" "$jq_lib $filter"
+}
 
 # --- Who are we asking about? ----------------------------------------------
 # glab resolves @me for assignee/reviewer but not reliably for --author, so
@@ -193,11 +317,6 @@ if [ -z "$author" ]; then
   exit 1
 fi
 
-# --- Fetch everything -------------------------------------------------------
-# One GraphQL request carries the whole job: every open non-draft MR of yours,
-# each with its approvals and its full note list. The REST version needed a
-# list call plus two calls per MR, so this is 2N+1 round trips collapsed to 1.
-#
 # The project path is derived from the git remote rather than looked up, so
 # that stays true - both the SSH and HTTPS remote forms reduce to group/repo.
 project_path=$(git remote get-url origin 2>/dev/null \
@@ -207,31 +326,99 @@ if [ -z "$project_path" ]; then
   exit 1
 fi
 
-progress "Fetching MRs..."
-graph_json=$(glab api graphql -f query="
-{
-  project(fullPath: \"$project_path\") {
-    mergeRequests(authorUsername: \"$author\", state: opened, draft: false, first: 100) {
-      nodes {
-        iid title webUrl createdAt draft conflicts
-        approvedBy { nodes { username } }
-        notes(first: 100) {
-          pageInfo { hasNextPage endCursor }
-          nodes { body system createdAt author { username } }
-        }
-      }
-    }
-  }
-}" 2>/dev/null)
-progress_clear
+# --- Slack ------------------------------------------------------------------
+# Slack is the only record of asks, so nothing below runs without it. Any
+# failure stops the script rather than printing a message with the waits
+# missing.
 
-if ! jq -e '.data.project.mergeRequests.nodes | type == "array"' <<<"${graph_json:-null}" >/dev/null 2>&1; then
-  echo "Could not fetch merge requests for '$author' in $project_path." >&2
-  jq -r '.errors[]?.message | "  " + .' <<<"${graph_json:-null}" 2>/dev/null >&2
+slack_token=$(security find-generic-password -s "$slack_keychain" -w 2>/dev/null)
+if [ -z "$slack_token" ]; then
+  echo "No Slack token in the Keychain item '$slack_keychain'. Store one with:" >&2
+  echo "  security add-generic-password -a \"\$USER\" -s $slack_keychain -w" >&2
   exit 1
 fi
 
-# --- Fetch the rest of any long note list -----------------------------------
+# One Slack Web API call; prints the response, or reports why it failed. The
+# token goes in through a file descriptor so it never shows up in `ps`.
+slack_api() {
+  local method="$1"
+  shift
+  local args=() pair out
+  for pair in "$@"; do
+    args+=(--data-urlencode "$pair")
+  done
+
+  out=$(curl -sS -G "https://slack.com/api/$method" \
+          -H @<(printf 'Authorization: Bearer %s' "$slack_token") \
+          ${args[@]+"${args[@]}"} 2>&1)
+  if ! jq -e '.ok == true' <<<"$out" >/dev/null 2>&1; then
+    progress_clear
+    line_red "Slack $method failed: $(jq -r '[.error // "unreadable response", (.needed // empty | "token needs scopes " + .)] | join(" - ")' <<<"$out" 2>/dev/null || printf '%s' "$out")"
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+progress "Checking Slack..."
+slack_user=$(slack_api auth.test | jq -r '.user_id // empty') || exit 1
+if [ -z "$slack_user" ]; then
+  progress_clear
+  echo "Slack did not say who the token belongs to." >&2
+  exit 1
+fi
+
+# Every message of yours in the channel since $1 (YYYY-MM-DD) that links an MR
+# in this project, as a JSON array with one entry per MR per message: a
+# message naming three MRs is one ask for each, and naming one twice is still
+# one ask. `root` is the thread the message lives in, so replies can be found.
+#
+# Slack stores a link as <url|label>, so the full URL is in the text even when
+# the visible label was shortened. Its `after:` is exclusive, so the caller
+# passes the day before the window opens.
+fetch_asks() {
+  local after="$1" page=1 pages=1 out all="[]"
+
+  while [ "$page" -le "$pages" ]; do
+    progress "Searching Slack (page $page of $pages)..."
+    out=$(slack_api search.messages \
+            "query=in:#$slack_channel from:<@$slack_user> merge_requests after:$after" \
+            count=100 "page=$page" sort=timestamp sort_dir=asc) || return 1
+    pages=$(jq '.messages.paging.pages // 0' <<<"$out")
+    all=$(jq -c --argjson acc "$all" --arg channel "$slack_channel" --arg path "$project_path" '
+      ("/" + ($path | gsub("\\."; "\\.")) + "/-/merge_requests/([0-9]+)") as $re
+      | $acc + [ .messages.matches[]
+          | select(.channel.name == $channel)
+          | . as $m
+          | ((($m.permalink // "") | capture("thread_ts=(?<t>[0-9.]+)") | .t) // $m.ts) as $root
+          | [ $m.text | scan($re) | .[0] ] | unique[]
+          | {iid: ., ts: ($m.ts | tonumber), ts_raw: $m.ts, root: $root, channel: $m.channel.id} ]
+    ' <<<"$out") || return 1
+    page=$(( page + 1 ))
+  done
+  progress_clear
+  printf '%s' "$all"
+}
+
+# The day before a YYYY-MM-DD date, for Slack's exclusive `after:`.
+day_before() {
+  date -j -v-1d -f %Y-%m-%d "$1" +%Y-%m-%d
+}
+
+# A year missing from bc_holidays would silently count its holidays as
+# working days, so say so for every year a calculation reaches into.
+warn_missing_holidays() {
+  local year="${1:0:4}" this_year
+  this_year=$(date +%Y)
+  while [ "$year" -le "$this_year" ]; do
+    if ! grep -q "$year-" <<<"$bc_holidays"; then
+      line_yellow "No BC holidays listed for $year in mrpost - counting its holidays as working days."
+    fi
+    year=$(( year + 1 ))
+  done
+}
+
+# --- GitLab -----------------------------------------------------------------
+
 # Notes come 100 to a page, and everything below reads them: the ready date,
 # the approval and its reset, the review comments. A busy MR can outgrow one
 # page, so any MR with more is paged through here, one request per extra page,
@@ -275,41 +462,172 @@ fetch_remaining_notes() {
   progress_clear
 }
 
-while IFS=$'\t' read -r iid cursor; do
-  [ -n "$iid" ] || continue
-  fetch_remaining_notes "$iid" "$cursor"
-done < <(jq -r '.data.project.mergeRequests.nodes[]
-                | select(.notes.pageInfo.hasNextPage == true)
-                | [.iid, .notes.pageInfo.endCursor] | @tsv' <<<"$graph_json")
+# One GraphQL request for a set of MRs, each with its full note list, into
+# graph_json. $1 is the mergeRequests() filter, $2 the extra fields the caller
+# reads. GitLab caps a query's complexity at 250 and the note list costs most
+# of that, so each mode asks only for what it uses.
+fetch_mrs() {
+  local filter="$1" fields="$2"
 
-# Everything the loop needs, derived in a single pass: when each MR became
-# reviewable, who approved it, and who left a real review comment. Doing it
-# here rather than per-MR means the loop makes no calls of its own at all.
-#
-# Ordered by ready date, so whatever has been waiting longest leads the message.
-#
-# Fields are separated by 0x1F rather than by the tab @tsv emits. Tab is an IFS
-# *whitespace* character, so `read` folds a run of them into one delimiter and
-# an empty field silently vanishes, shifting every later column left. An MR
-# with no approvals but real comments hit exactly that. 0x1F is not whitespace,
-# so empty fields survive; @tsv has already escaped any literal tab or newline
-# in the data, which is what makes the translation safe.
-rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
-              --arg marker "$notice_marker" '
-  def names($who):
-    ($who | unique | map("@" + .)) as $n
-    | if ($n | length) <= 3 then ($n | join(", "))
-      else (($n[0:2] | join(", ")) + " and \(($n | length) - 2) others") end;
+  progress "Fetching MRs..."
+  graph_json=$(glab api graphql -f query="
+{
+  project(fullPath: \"$project_path\") {
+    mergeRequests($filter, first: 100) {
+      nodes {
+        iid title webUrl createdAt draft $fields
+        notes(first: 100) {
+          pageInfo { hasNextPage endCursor }
+          nodes { body system createdAt author { username } }
+        }
+      }
+    }
+  }
+}" 2>/dev/null)
+  progress_clear
 
+  if ! jq -e '.data.project.mergeRequests.nodes | type == "array"' <<<"${graph_json:-null}" >/dev/null 2>&1; then
+    echo "Could not fetch merge requests for '$author' in $project_path." >&2
+    # glab can put its own text before the JSON, so fall back to the raw reply.
+    jq -r '.errors[]?.message | "  " + .' <<<"${graph_json:-null}" 2>/dev/null >&2 \
+      || printf '  %s\n' "${graph_json:-no response}" | head -3 >&2
+    return 1
+  fi
+
+  while IFS=$'\t' read -r iid cursor; do
+    [ -n "$iid" ] || continue
+    fetch_remaining_notes "$iid" "$cursor"
+  done < <(jq -r '.data.project.mergeRequests.nodes[]
+                  | select(.notes.pageInfo.hasNextPage == true)
+                  | [.iid, .notes.pageInfo.endCursor] | @tsv' <<<"$graph_json")
+}
+
+# The date the oldest fetched MR was opened, so the Slack search reaches back
+# to its first ask. A day earlier again absorbs the UTC/local difference.
+earliest_mr_date() {
+  jq -r '[.data.project.mergeRequests.nodes[].createdAt] | min // empty | .[0:10]' <<<"$graph_json"
+}
+
+# --- Stats ------------------------------------------------------------------
+if [ -n "$stats_mode" ]; then
+  asks_json=$(fetch_asks "$(day_before "$stats_since")") || exit 1
+
+  iids=$(jq -c '[.[].iid] | unique' <<<"$asks_json")
+  if [ "$(jq 'length' <<<"$iids")" -eq 0 ]; then
+    echo "No review asks for $project_path in #$slack_channel since $stats_since." >&2
+    exit 0
+  fi
+  if [ "$(jq 'length' <<<"$iids")" -gt 100 ]; then
+    echo "More than 100 MRs asked about since $stats_since - pick a later --since." >&2
+    exit 1
+  fi
+
+  fetch_mrs "authorUsername: \"$author\", iids: $iids" "state mergedAt closedAt" || exit 1
+
+  # An MR asked about in the window may have had rounds before it, so reach
+  # back to the oldest one's creation and search again from there.
+  earliest=$(earliest_mr_date)
+  window_start="$stats_since"
+  if [ -n "$earliest" ] && [[ "$earliest" < "$stats_since" ]]; then
+    window_start="$earliest"
+    asks_json=$(fetch_asks "$(day_before "$earliest")") || exit 1
+  fi
+
+  warn_missing_holidays "$window_start"
+
+  jq_clock -r --slurpfile asks_file <(printf '%s' "$asks_json") \
+    --arg author "$author" --arg ignore "$ignore_commenters" \
+    --arg marker "$notice_marker" --arg since "$stats_since" \
+    --argjson now "$(date +%s)" '
+    ($ignore | split(",") | map(select(length > 0))) as $bots
+    | $asks_file[0] as $asks
+    | [ .data.project.mergeRequests.nodes[]
+        | . as $mr
+        | clock($asks; $author; $bots; $marker; $now) as $c
+        | select(($c.rounds | length) > 0 or $c.open != null)
+        | {mr: $mr, c: $c,
+           first: ([ $c.rounds[].asked, ($c.open.asked // empty) ] | min)} ]
+    | sort_by(.first) as $all
+
+    # A round still open on a merged or closed MR ended there, unreviewed.
+    # Both are timed from the ask to that end.
+    | def nudges($asks): ($asks | length) - 1 | if . > 0 then " (\(plural(.; "nudge")))" else "" end;
+      def round_lines($m; $c):
+        [ $c.rounds | to_entries[]
+          | "  Round \(.key + 1): asked \(.value.asked | time_label)\(nudges(.value.asks)), "
+            + (if .value.what == "draft" then "marked draft "
+               else "\(.value.what | if . == "approval" then "approved" else "reviewed" end) by @\(.value.by) " end)
+            + "\(.value.reviewed | time_label) after \(business_span(.value.wait))" ]
+        + (if $c.open == null then []
+           else [ "  Round \(($c.rounds | length) + 1): asked \($c.open.asked | time_label)\(nudges($c.open.asks)), "
+                  + (if $m.state == "merged" then
+                       "merged \($m.mergedAt | epoch | time_label) without a review, after \(business_span(business_secs($c.open.asked; $m.mergedAt | epoch)))"
+                     elif $m.state == "closed" then
+                       "closed \($m.closedAt | epoch | time_label) without a review, after \(business_span(business_secs($c.open.asked; $m.closedAt | epoch)))"
+                     else "waiting \(business_span($c.open.wait)) so far" end) ]
+           end);
+
+    # A round ended by going back to draft was real waiting, but it never got
+    # a review, so it stays out of the review-wait figures. A round the MR was
+    # closed on, unreviewed, stays in: the wait ran until the close, and
+    # leaving abandoned MRs out would flatter the median.
+    [ $all[] | .mr.iid as $iid | .c.rounds[] | select(.what != "draft") | {wait, iid: $iid} ] as $reviewed
+    | [ $all[] | select(.mr.state == "closed" and .c.open != null and .mr.closedAt != null)
+        | {wait: business_secs(.c.open.asked; .mr.closedAt | epoch), iid: .mr.iid} ] as $closed
+    | ([ $all[] | .c.rounds[] | select(.what == "draft") ] | length) as $drafted
+    | ($reviewed + $closed | sort_by(.wait)) as $sorted
+    | ([ $all[] | select(.c.open != null and .mr.state == "opened") ] | length) as $waiting
+
+    | ([ $all[]
+         | "!\(.mr.iid) \(.mr.title) (\(.mr.state | if . == "opened" then "open" else . end))",
+           (round_lines(.mr; .c)[]),
+           "" ]
+       + [ "\($all | length) MRs asked about since \($since), \([ $all[] | (.c.rounds[].asks | length), (.c.open.asks // [] | length) ] | add) asks, "
+           + "\($reviewed | length) rounds reviewed, \($closed | length) closed unreviewed, \($drafted) ended by going to draft, \($waiting) still waiting" ]
+       + (if ($sorted | length) == 0 then []
+          else [ "Wait per reviewed or closed round: median \(business_span($sorted[($sorted | length) / 2 | floor].wait)), "
+                 + "longest \(business_span($sorted[-1].wait)) (!\($sorted[-1].iid))" ]
+          end))
+    | .[]
+  ' <<<"$graph_json" || exit 1
+  exit 0
+fi
+
+# --- Fetch everything -------------------------------------------------------
+# One GraphQL request carries the whole job: every open non-draft MR of yours,
+# each with its approvals and its full note list.
+fetch_mrs "authorUsername: \"$author\", state: opened, draft: false" \
+  "conflicts approvedBy { nodes { username } }" || exit 1
+
+if [ "$(jq '.data.project.mergeRequests.nodes | length' <<<"$graph_json")" -eq 0 ]; then
+  echo "No open, non-draft merge requests authored by $author in $project_path." >&2
+  exit 0
+fi
+
+# Asks reaching back to when the oldest open MR was opened cover every round
+# any of them has had.
+earliest=$(earliest_mr_date)
+asks_json=$(fetch_asks "$(day_before "$earliest")") || exit 1
+warn_missing_holidays "$earliest"
+
+# Everything the loop needs, derived in a single pass: each MR's review clock
+# and its line for the message, who approved it, and who left a real review
+# comment. Doing it here rather than per-MR means the loop makes no calls of
+# its own at all.
+#
+# Ordered by when the reviewers got it, so whatever has been waiting longest
+# leads the message and MRs this post hands over come last.
+analysis_json=$(jq_clock -c --slurpfile asks_file <(printf '%s' "$asks_json") \
+              --arg author "$author" --arg ignore "$ignore_commenters" \
+              --arg marker "$notice_marker" --argjson now "$(date +%s)" '
   ($ignore | split(",") | map(select(length > 0))) as $bots
+  | $asks_file[0] as $asks
   | .data.project.mergeRequests.nodes
   | map(select(.draft != true))
   | map(. as $mr
     | [ $mr.notes.nodes[]? | select(.system == true) ] as $sys
 
-    # What counts as someone having actually reviewed it: not system notes,
-    # not the Nx Cloud summary (found by the marker it signs its body with),
-    # not the integration accounts, and not your own comments.
+    # Review comments as the clock counts them, for the prompt below.
     | [ $mr.notes.nodes[]?
         | select(.system != true)
         | select(($marker == "") or (((.body // "") | contains($marker)) | not)) ] as $human
@@ -328,111 +646,47 @@ rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
     | {
       iid: $mr.iid, title: $mr.title, webUrl: $mr.webUrl,
       conflicts: $mr.conflicts,
-      reviewed_kind: $kind,
-      reviewed_at: ($reviewed // ""),
-      reviewers: (if $kind == "approved" then [ $approval.author.username ]
-                  else [ $reviews[].author.username ] end),
 
-      # Reviewed once and since answered, so it wants another look, aged from
-      # the first answer. After review comments only a push counts: a reply
-      # alone usually means the work is still to do, and posting it would get
-      # an "I already reviewed that". After an approval, a push, a revoke or a
-      # reset note does. A standing approval never gets here, since approved
-      # MRs are dropped. One whose approval has gone with no note to say why
-      # is dated from the approval itself, which is the best date there is;
-      # not every GitLab version writes the reset note. Comments with no push
-      # since leave this empty: the next move is yours, so the loop asks.
-      rereview_at: (if $kind == "" then "" else
-                      (if $kind == "commented" then "^added [0-9]+ commits?"
-                       else "^added [0-9]+ commits?|^unapproved this merge request|^reset approvals" end) as $answer
-                      | ([ $sys[] | select(.body | test($answer; "i"))
-                                  | .createdAt | select(. > $reviewed) ] | sort | first)
-                        // (if $kind == "approved" and ($mr.approvedBy.nodes | length) == 0
-                            then $reviewed else "" end)
-                    end),
-
-      # The draft/ready flip is a system note. Newest wins - an MR can be
-      # flipped more than once - and one opened ready has no such note at all,
-      # so its creation date is when it became reviewable. Anchored, because
-      # an unanchored "ready" also matches "already" in a commit-list note.
-      ready: ([ $mr.notes.nodes[]?
-                | select(.system == true)
-                | select(.body | test("^marked this merge request as \\*\\*ready\\*\\*$|^unmarked as a work in progress"; "i"))
-                | .createdAt ] | sort | last // $mr.createdAt),
+      # Answered since the last review round. This no longer moves the clock -
+      # only an ask does - but it decides whether to ask before chasing: after
+      # review comments only a push counts, since a reply alone usually means
+      # the work is still to do. After an approval, a push, a revoke or a
+      # reset note does. An approval gone with no note to say why counts as
+      # answered; not every GitLab version writes the reset note.
+      answered: (if $kind == "" then false else
+                   (if $kind == "commented" then "^added [0-9]+ commits?"
+                    else "^added [0-9]+ commits?|^unapproved this merge request|^reset approvals" end) as $answer
+                   | ([ $sys[] | select(.body | test($answer; "i"))
+                               | .createdAt | select(. > $reviewed) ] | length > 0)
+                     or ($kind == "approved" and ($mr.approvedBy.nodes | length) == 0)
+                 end),
 
       approvers: [ $mr.approvedBy.nodes[]?.username ],
-      commenters: [ $reviews[].author.username ]
-    })
-
-  # An MR up for re-review has been waiting since it was answered, not since
-  # it first went ready - unless it went back to draft and was readied again
-  # after that.
-  | map(.since = ([.ready, .rereview_at] | max))
-  | sort_by(.since)
-  | .[]
-  | [ .iid, .title, .webUrl, .since,
-      (.approvers | length | tostring), names(.approvers),
-      (.commenters | length | tostring), names(.commenters),
-      (.conflicts | tostring), .rereview_at, .reviewed_kind, .reviewed_at,
-      names(.reviewers) ]
-  | @tsv
-' <<<"$graph_json" | tr '\t' '\037')
-
-if [ -z "$rows" ]; then
-  echo "No open, non-draft merge requests authored by $author in $project_path." >&2
-  exit 0
+      commenters: [ $reviews[].author.username ],
+      clock: ($mr | clock($asks; $author; $bots; $marker; $now))
+    }
+    | .line = (.clock | channel_line))
+  | sort_by(.clock.open.asked // $now)
+' <<<"$graph_json")
+if [ -z "$analysis_json" ]; then
+  echo "Could not work out the review clocks." >&2
+  exit 1
 fi
 
-# --- Helpers ----------------------------------------------------------------
-
-# Seconds since an ISO 8601 UTC timestamp like 2026-08-27T17:00:47.872Z.
-age_seconds() {
-  local iso="${1%%.*}"     # drop fractional seconds
-  iso="${iso%Z}"           # drop the trailing Z
-  local then
-  then=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$iso" +%s 2>/dev/null) || return 1
-  echo $(( $(date +%s) - then ))
-}
-
-plural() { [ "$1" -eq 1 ] && echo "$1 $2" || echo "$1 ${2}s"; }
-
-# An hour is the finest unit on purpose. Anything more precise would make the
-# message text change between two runs minutes apart, and the duplicate check
-# below relies on an unchanged message meaning an unchanged situation.
-human_age() {
-  local secs="$1"
-  if   [ "$secs" -lt 3600 ];    then echo "less than an hour"
-  elif [ "$secs" -lt 86400 ];   then plural $(( secs / 3600 )) hour
-  elif [ "$secs" -lt 1209600 ]; then plural $(( secs / 86400 )) day
-  else                               plural $(( secs / 604800 )) week
-  fi
-}
-
-# Past messages that mentioned this MR, oldest first.
-#
-# One history file is one post, so this lists *files* rather than counting
-# occurrences - a link named twice in a single message was still only posted
-# once. Matching is on the host and path so a change of scheme still lines up,
-# with a trailing non-digit boundary so !412 does not also match !4120.
-mentions_of() {
-  local url="$1"
-  local needle="${url#*://}"
-  local escaped
-  escaped=$(printf '%s' "$needle" | sed 's/[.[\*^$()+?{}|\\]/\\&/g')
-
-  # A missing history directory is the normal first-run case, not an error.
-  grep -lE "${escaped}([^0-9]|\$)" "$history_dir"/*"$history_ext" 2>/dev/null | sort
-}
-
-# Strip the posted count so two messages can be compared on their substance.
-#
-# The count is guaranteed to differ between consecutive runs - the first
-# message has no suffix, the second says "Posted here 1 time" - so comparing it
-# would mean a repeat run never matched the one before it, which is the exact
-# case this is meant to catch.
-without_counts() {
-  sed 's/ - Posted here [0-9][0-9]* times*$//'
-}
+# Fields are separated by 0x1F rather than by the tab @tsv emits. Tab is an IFS
+# *whitespace* character, so `read` folds a run of them into one delimiter and
+# an empty field silently vanishes, shifting every later column left. An MR
+# with no approvals but real comments hit exactly that. 0x1F is not whitespace,
+# so empty fields survive; @tsv has already escaped any literal tab or newline
+# in the data, which is what makes the translation safe.
+rows=$(jq_clock -r '
+  .[]
+  | [ .iid, .title, .webUrl,
+      (.approvers | length | tostring), names(.approvers),
+      (.commenters | length | tostring), names(.commenters),
+      (.conflicts | tostring), (.answered | tostring), .line ]
+  | @tsv
+' <<<"$analysis_json" | tr '\t' '\037')
 
 # Ask whether an MR that already has review comments should still be chased.
 #
@@ -463,12 +717,13 @@ confirm_post() {
 
 # --- Build the message ------------------------------------------------------
 message=""
+included_iids=""
 approved_list=""
 approved_count=0
 conflicted_list=""
 conflicted_count=0
 
-while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers comment_count commenters conflicts rereview_at reviewed_kind reviewed_at reviewers; do
+while IFS=$'\037' read -r iid title web_url approval_count approvers comment_count commenters conflicts answered line; do
   [ -n "$iid" ] || continue
 
   # Nobody can review what will not merge, so a conflicted MR is dropped and
@@ -489,68 +744,88 @@ while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers co
     continue
   fi
 
-  # Comments with a push since are a finished round, back with the reviewers.
-  # Without one the next move is probably yours, so ask before chasing it.
-  if [ -z "$assume_yes" ] && [ -z "$rereview_at" ] && [ "${comment_count:-0}" -gt 0 ]; then
+  # Comments with a push since are a finished round, ready to hand back.
+  # Without one the next move is probably yours, so ask before chasing it -
+  # posting starts the reviewers' clock whether or not anything changed.
+  if [ -z "$assume_yes" ] && [ "$answered" != "true" ] && [ "${comment_count:-0}" -gt 0 ]; then
     confirm_post "$iid" "$web_url" "$comment_count" "$commenters" || continue
-  fi
-
-  # An MR that has had a review round already is asked for a second look
-  # rather than a first, with when that round was and who did it, so the
-  # channel can see it is not starting from nothing.
-  if [ -n "$rereview_at" ]; then
-    status="Ready for re-review"
-  else
-    status="Ready for review"
-  fi
-
-  secs=$(age_seconds "$ready_at")
-  if [ -n "$secs" ]; then
-    detail="$status $(human_age "$secs") ago"
-  else
-    detail="$status $ready_at"
-  fi
-
-  if [ -n "$rereview_at" ]; then
-    if [ "$reviewed_kind" = "approved" ]; then
-      round="last approved"
-    else
-      round="last reviewed"
-    fi
-    reviewed_secs=$(age_seconds "$reviewed_at")
-    if [ -n "$reviewed_secs" ]; then
-      detail="$detail ($round $(human_age "$reviewed_secs") ago by $reviewers)"
-    else
-      detail="$detail ($round $reviewed_at by $reviewers)"
-    fi
-  fi
-
-  # Opt-in: naming the count in the channel is a pointed thing to do, so it is
-  # off unless asked for. History is still recorded either way, so turning the
-  # flag on later reports every message that has already gone out.
-  #
-  # Counted before this run's own file is written, so an MR is never counted as
-  # a mention of itself. Silent the first time an MR appears - there is nothing
-  # to nag about yet; from the second message onwards the count is the point.
-  if [ -n "$show_post_count" ]; then
-    mention_files=$(mentions_of "$web_url")
-    if [ -n "$mention_files" ]; then
-      posted=$(printf '%s\n' "$mention_files" | wc -l | tr -d ' ')
-      detail="$detail - Posted here $(plural "$posted" time)"
-    fi
   fi
 
   message+="!${iid} — ${title}"$'\n'
   message+="${web_url}"$'\n'
-  message+="${detail}"$'\n\n'
+  message+="${line}"$'\n\n'
+  included_iids+="${iid} "
 done <<<"$rows"
 
 message="${message%$'\n\n'}"
 progress_clear
 
+# Replies under your asks for the MRs in this message, so you can read them
+# before posting and edit the message if one changes the picture. Only the
+# latest round's asks: an older round's replies are about a finished review.
+# Grouped by thread, since one ask often names several MRs. On stderr, so they
+# stay out of the paste buffer.
+report_replies() {
+  [ -n "$included_iids" ] || return 0
+  local threads root channel after mrs replies out all_replies="" user_ids names_json="{}" uid info
+
+  threads=$(jq -r --arg keep "$included_iids" '
+    ($keep | split(" ") | map(select(length > 0))) as $k
+    | [ .[] | select(.iid as $i | $k | index($i)) | .iid as $iid
+        | (if .clock.open != null then .clock.open.asks
+           elif (.clock.rounds | length) > 0 then .clock.rounds[-1].asks
+           else [] end)[]
+        | {root, channel, ts, ts_raw, iid: $iid} ]
+    | group_by(.root)[]
+    | (min_by(.ts)) as $first
+    | [ $first.root, $first.channel, $first.ts_raw, (map("!" + .iid) | unique | join(", ")) ]
+    | @tsv
+  ' <<<"$analysis_json")
+  [ -n "$threads" ] || return 0
+
+  while IFS=$'\t' read -r root channel after mrs; do
+    [ -n "$root" ] || continue
+    progress "Reading Slack threads..."
+    replies=$(slack_api conversations.replies "channel=$channel" "ts=$root" limit=200) || return 1
+    out=$(jq -c --arg me "$slack_user" --arg after "$after" --arg mrs "$mrs" '
+      [ .messages[]
+        | select(.user != null and .user != $me and .bot_id == null)
+        | select((.ts | tonumber) > ($after | tonumber))
+        | {user, ts: (.ts | tonumber), text} ]
+      | select(length > 0)
+      | {after: ($after | tonumber), mrs: $mrs, replies: .}
+    ' <<<"$replies")
+    [ -n "$out" ] && all_replies+="$out"$'\n'
+  done <<<"$threads"
+  progress_clear
+  [ -n "$all_replies" ] || return 0
+
+  # Slack gives user IDs; look each one up once for a readable name.
+  user_ids=$(jq -r '.replies[].user' <<<"$all_replies" | sort -u)
+  while read -r uid; do
+    [ -n "$uid" ] || continue
+    info=$(slack_api users.info "user=$uid") || return 1
+    names_json=$(jq -c --arg id "$uid" --argjson info "$info" '
+      . + {($id): ($info.user | (.profile.display_name | select(length > 0)) // .real_name // .name // $id)}
+    ' <<<"$names_json")
+  done <<<"$user_ids"
+
+  echo >&2
+  echo "Thread replies since you last asked:" >&2
+  jq_clock -rs --argjson names "$names_json" '
+    def tidy: gsub("<(?<u>https?://[^|>]+)\\|(?<l>[^>]+)>"; .l)
+              | gsub("<(?<u>https?://[^>]+)>"; .u)
+              | gsub("<@(?<id>[A-Z0-9]+)>"; "@" + ($names[.id] // .id))
+              | gsub("\n"; "\n      ");
+    .[]
+    | "  Your \(.after | time_label) ask (\(.mrs)):",
+      (.replies[] | "    @\($names[.user] // .user) \(.ts | time_label): \(.text | tidy)")
+  ' <<<"$all_replies" >&2
+}
+
 # What was dropped for being approved. Goes to stderr, below the message, so it
-# stays out of both the paste buffer and the saved history - it is a note to
-# self about MRs that need no chasing, not something the channel needs.
+# stays out of the paste buffer - it is a note to self about MRs that need no
+# chasing, not something the channel needs.
 report_approved() {
   [ "$approved_count" -gt 0 ] || return 0
   echo >&2
@@ -567,8 +842,7 @@ report_conflicted() {
   printf '%s' "$conflicted_list" >&2
 }
 
-# Everything was declined - say so rather than emitting a blank message and
-# recording it as a post that went to the channel.
+# Everything was declined - say so rather than emitting a blank message.
 if [ -z "$message" ]; then
   echo "Nothing to post." >&2
   report_approved
@@ -580,31 +854,10 @@ printf '%s\n' "$message"
 
 copy_to_clipboard "$message"
 
+# A failed reply lookup still fails the run, but only after the other
+# reports, so a Slack problem never hides which MRs were dropped.
+report_replies
+replies_status=$?
 report_approved
 report_conflicted
-
-# --- Record this run --------------------------------------------------------
-# Last, so the counts above reflect only earlier messages. A directory that
-# cannot be created or written is worth a warning but not a failure: the
-# message is already out, and losing the record beats losing the message.
-if mkdir -p "$history_dir" 2>/dev/null; then
-  previous=$(latest_history)
-
-  # Running twice in a row with nothing changed is a slip, not a second post,
-  # so it should not inflate the counts. Compared on substance rather than
-  # byte-for-byte; see without_counts.
-  if [ -n "$previous" ] && [ -r "$previous" ] \
-     && [ "$(printf '%s\n' "$message" | without_counts)" \
-        = "$(without_counts < "$previous")" ]; then
-    echo "Same message as $(history_date "$previous") - not recording it again." >&2
-  else
-    history_file="$history_dir/$(date +%Y-%m-%d-%H%M%S)$history_ext"
-    # The redirection is what fails on a read-only directory, and bash reports
-    # that itself, so the whole group has to be muffled - not just printf.
-    if ! { printf '%s\n' "$message" > "$history_file"; } 2>/dev/null; then
-      echo "Could not write history file: $history_file" >&2
-    fi
-  fi
-else
-  echo "Could not create history directory: $history_dir" >&2
-fi
+exit "$replies_status"
