@@ -307,26 +307,49 @@ rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
   | map(. as $mr
     | [ $mr.notes.nodes[]? | select(.system == true) ] as $sys
 
-    # The newest approval on record, whether or not it still stands.
-    | ([ $sys[] | select(.body | test("^approved this merge request"; "i"))
-                | .createdAt ] | sort | last) as $approved
+    # What counts as someone having actually reviewed it: not system notes,
+    # not the Nx Cloud summary (found by the marker it signs its body with),
+    # not the integration accounts, and not your own comments.
+    | [ $mr.notes.nodes[]?
+        | select(.system != true)
+        | select(($marker == "") or (((.body // "") | contains($marker)) | not)) ] as $human
+    | [ $human[] | . as $n | $n.author.username as $u
+        | select($u != $author and (($bots | index($u)) == null)) | $n ] as $reviews
+
+    # The newest approval on record, whether or not it still stands, and the
+    # newest review comment. Whichever is later is the last review round.
+    | ([ $sys[] | select(.body | test("^approved this merge request"; "i")) ]
+       | sort_by(.createdAt) | last) as $approval
+    | ([ $reviews[].createdAt ] | sort | last) as $commented
+    | (if $approval != null and ($commented == null or $approval.createdAt >= $commented)
+       then "approved" elif $commented != null then "commented" else "" end) as $kind
+    | (if $kind == "approved" then $approval.createdAt else $commented end) as $reviewed
 
     | {
       iid: $mr.iid, title: $mr.title, webUrl: $mr.webUrl,
       conflicts: $mr.conflicts,
-      approved_at: ($approved // ""),
+      reviewed_kind: $kind,
+      reviewed_at: ($reviewed // ""),
+      reviewers: (if $kind == "approved" then [ $approval.author.username ]
+                  else [ $reviews[].author.username ] end),
 
-      # Approved once but approved by nobody now: a push reset it, or the
-      # approver took it back. Either way it wants another look, from the first
-      # thing after that approval that could have cleared it. Worked out from
-      # the approval going missing rather than from the reset note, which not
-      # every GitLab version writes. If nothing matches, the approval itself is
-      # the best date there is.
-      reset_at: (if $approved != null and ($mr.approvedBy.nodes | length) == 0 then
-                   ([ $sys[] | select(.createdAt > $approved)
-                             | select(.body | test("^added [0-9]+ commits?|^unapproved this merge request|^reset approvals"; "i"))
-                             | .createdAt ] | sort | first // $approved)
-                 else "" end),
+      # Reviewed once and since answered, so it wants another look, aged from
+      # the first answer. After review comments only a push counts: a reply
+      # alone usually means the work is still to do, and posting it would get
+      # an "I already reviewed that". After an approval, a push, a revoke or a
+      # reset note does. A standing approval never gets here, since approved
+      # MRs are dropped. One whose approval has gone with no note to say why
+      # is dated from the approval itself, which is the best date there is;
+      # not every GitLab version writes the reset note. Comments with no push
+      # since leave this empty: the next move is yours, so the loop asks.
+      rereview_at: (if $kind == "" then "" else
+                      (if $kind == "commented" then "^added [0-9]+ commits?"
+                       else "^added [0-9]+ commits?|^unapproved this merge request|^reset approvals" end) as $answer
+                      | ([ $sys[] | select(.body | test($answer; "i"))
+                                  | .createdAt | select(. > $reviewed) ] | sort | first)
+                        // (if $kind == "approved" and ($mr.approvedBy.nodes | length) == 0
+                            then $reviewed else "" end)
+                    end),
 
       # The draft/ready flip is a system note. Newest wins - an MR can be
       # flipped more than once - and one opened ready has no such note at all,
@@ -338,27 +361,20 @@ rows=$(jq -r --arg author "$author" --arg ignore "$ignore_commenters" \
                 | .createdAt ] | sort | last // $mr.createdAt),
 
       approvers: [ $mr.approvedBy.nodes[]?.username ],
-
-      # What counts as someone having actually reviewed it: not system notes,
-      # not the Nx Cloud summary (found by the marker it signs its body with),
-      # not the integration accounts, and not your own comments.
-      commenters: [ $mr.notes.nodes[]?
-                    | select(.system != true)
-                    | select(($marker == "") or (((.body // "") | contains($marker)) | not))
-                    | .author.username
-                    | . as $u
-                    | select($u != $author and (($bots | index($u)) == null)) ]
+      commenters: [ $reviews[].author.username ]
     })
 
-  # A reset MR has been waiting since the reset, not since it first went
-  # ready - unless it went back to draft and was readied again after that.
-  | map(.since = ([.ready, .reset_at] | max))
+  # An MR up for re-review has been waiting since it was answered, not since
+  # it first went ready - unless it went back to draft and was readied again
+  # after that.
+  | map(.since = ([.ready, .rereview_at] | max))
   | sort_by(.since)
   | .[]
   | [ .iid, .title, .webUrl, .since,
       (.approvers | length | tostring), names(.approvers),
       (.commenters | length | tostring), names(.commenters),
-      (.conflicts | tostring), .reset_at, .approved_at ]
+      (.conflicts | tostring), .rereview_at, .reviewed_kind, .reviewed_at,
+      names(.reviewers) ]
   | @tsv
 ' <<<"$graph_json" | tr '\t' '\037')
 
@@ -432,7 +448,7 @@ confirm_post() {
   echo "MR ${iid} has $(plural "$count" comment) from ${who} ${web_url}" >&2
 
   # Nobody to ask - keep the MR rather than silently shortening the message.
-  if [ ! -e /dev/tty ] || ! : >/dev/tty 2>/dev/null; then
+  if [ ! -e /dev/tty ] || ! { : >/dev/tty; } 2>/dev/null; then
     echo "Post anyway? y/N - no terminal to ask on, keeping it." >&2
     return 0
   fi
@@ -452,7 +468,7 @@ approved_count=0
 conflicted_list=""
 conflicted_count=0
 
-while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers comment_count commenters conflicts reset_at approved_at; do
+while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers comment_count commenters conflicts rereview_at reviewed_kind reviewed_at reviewers; do
   [ -n "$iid" ] || continue
 
   # Nobody can review what will not merge, so a conflicted MR is dropped and
@@ -473,14 +489,16 @@ while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers co
     continue
   fi
 
-  if [ -z "$assume_yes" ] && [ "${comment_count:-0}" -gt 0 ]; then
+  # Comments with a push since are a finished round, back with the reviewers.
+  # Without one the next move is probably yours, so ask before chasing it.
+  if [ -z "$assume_yes" ] && [ -z "$rereview_at" ] && [ "${comment_count:-0}" -gt 0 ]; then
     confirm_post "$iid" "$web_url" "$comment_count" "$commenters" || continue
   fi
 
-  # An MR whose approval was reset has had one review already, so the channel
-  # is asked for a second look rather than a first, with the date of the
-  # approval that was lost.
-  if [ -n "$reset_at" ]; then
+  # An MR that has had a review round already is asked for a second look
+  # rather than a first, with when that round was and who did it, so the
+  # channel can see it is not starting from nothing.
+  if [ -n "$rereview_at" ]; then
     status="Ready for re-review"
   else
     status="Ready for review"
@@ -493,12 +511,17 @@ while IFS=$'\037' read -r iid title web_url ready_at approval_count approvers co
     detail="$status $ready_at"
   fi
 
-  if [ -n "$reset_at" ]; then
-    approved_secs=$(age_seconds "$approved_at")
-    if [ -n "$approved_secs" ]; then
-      detail="$detail (last approved $(human_age "$approved_secs") ago)"
+  if [ -n "$rereview_at" ]; then
+    if [ "$reviewed_kind" = "approved" ]; then
+      round="last approved"
     else
-      detail="$detail (last approved $approved_at)"
+      round="last reviewed"
+    fi
+    reviewed_secs=$(age_seconds "$reviewed_at")
+    if [ -n "$reviewed_secs" ]; then
+      detail="$detail ($round $(human_age "$reviewed_secs") ago by $reviewers)"
+    else
+      detail="$detail ($round $reviewed_at by $reviewers)"
     fi
   fi
 

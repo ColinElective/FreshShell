@@ -136,22 +136,35 @@ The test is `approved_by` being non-empty, deliberately not `approvals_left ==
 0` — a project that requires no approvals reports zero left from the moment an
 MR opens, which would drop everything before anyone had looked at it.
 
-### Reset approvals
+### Re-review
 
-An MR that *was* approved but has no approvals now — a push reset them, or the
-approver revoked — stays in the message, asking for a second look:
+An MR that has had a review round you have since answered is asked about as a
+second look rather than a first, so the channel can see it is not starting from
+nothing:
 
 ```
 !1523 — Fix the thing
 https://gitlab.com/.../1523
-Ready for re-review 2 hours ago (last approved 5 days ago)
+Ready for re-review 2 hours ago (last reviewed 2 days ago by @bgerude)
 ```
 
-"Last approved" is the newest *approved this merge request* note. The re-review
-age counts from the first push, revoke or reset note after it, and the MR is
-sorted by that date rather than by when it first went ready. The reset is
-detected from the approval going missing rather than from GitLab's reset note,
-since not every GitLab version writes one.
+The round is whichever came last: the newest review comment (counted by the
+same rules as the review-comment check below) or the newest *approved this
+merge request* note, in which case it reads "last approved". The re-review age
+counts from your first answer after it, and the MR is sorted by that date
+rather than by when it first went ready:
+
+- after **comments**, only a push. A reply on its own doesn't count, since it
+  usually means the work is still to come, and posting the MR then invites an
+  "I already reviewed that". With no push since the newest review comment the
+  MR stays plain "Ready for review" and goes through the comment prompt.
+- after an **approval**, only once the approval has gone. A push, a revoke or
+  a reset note marks when. The reset is detected from the approval going
+  missing rather than from GitLab's reset note, since not every GitLab version
+  writes one, so an approval that vanished with no note is dated from the
+  approval itself.
+
+A round with a push since skips the comment prompt: it is back with the reviewers.
 
 ### Merge conflicts
 
@@ -174,9 +187,9 @@ about one too many rather than silently dropping one.
 
 ### Review-comment check
 
-Before an MR goes into the message, `mrpost` checks it for review comments —
-comments usually mean someone has already looked, so nagging the channel may be
-the wrong move. If it finds any, it asks:
+Before an MR goes into the message, `mrpost` checks it for review comments with
+no push after them. Those usually mean the next move is yours, so nagging the
+channel may be the wrong move. If it finds any, it asks:
 
 ```
 MR 412 has 1 comment from @valentina824026 https://gitlab.com/...
