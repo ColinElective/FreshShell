@@ -366,7 +366,8 @@ def channel_line:
       + (if any($c.reviews[]; .t < $c.open.asked) then "re-review" else "review" end)
       + " - asked \(plural($c.open.asks | length; "time")) since \($c.open.asked | day_label)"
     elif ($c.reviews | length) == 0 then
-      "Ready for review"
+      # Nothing to say about an MR nobody has had yet: the post is the ask.
+      ""
     else
       # The reviewers of the last round that ended in a review, not one that
       # ended by going back to draft.
@@ -856,7 +857,10 @@ while IFS=$'\037' read -r iid title web_url approval_count approvers comment_cou
 
   message+="!${iid} — ${title}"$'\n'
   message+="${web_url}"$'\n'
-  message+="${line}"$'\n\n'
+  if [ -n "$line" ]; then
+    message+="${line}"$'\n'
+  fi
+  message+=$'\n'
   included_iids+="${iid} "
 done <<<"$rows"
 
