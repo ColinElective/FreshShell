@@ -366,7 +366,7 @@ def channel_line:
       + (if any($c.reviews[]; .t < $c.open.asked) then "re-review" else "review" end)
       + " - asked \(plural($c.open.asks | length; "time")) since \($c.open.asked | day_label)"
     elif ($c.reviews | length) == 0 then
-      if ($c.rounds | length) == 0 then "Ready for review - first ask" else "Ready for review" end
+      "Ready for review"
     else
       # The reviewers of the last round that ended in a review, not one that
       # ended by going back to draft.
