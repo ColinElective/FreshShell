@@ -34,6 +34,11 @@ Usage: mrpost [options]
       --no-copy            Print the message without touching the clipboard.
   -y, --yes                Include every MR without asking, even ones that
                            already have review comments.
+  -p, --prev               Reprint the last message and copy it, without
+                           contacting GitLab or Slack. Its wait times are as
+                           of when it was built.
+  -f, --fresh, --no-cache  Ignore cached GitLab and Slack responses and fetch
+                           everything again. The cache is still refreshed.
       --stats              Instead of the channel message, print every MR you
                            asked for review on since --since: each round, how
                            long it waited, and totals. Never copied.
@@ -58,6 +63,10 @@ Environment:
                              security add-generic-password -a "$USER" -s mrpost-slack -w
   MRPOST_TZ                Timezone of the 9-17 working day (default:
                            America/Vancouver).
+  MRPOST_DIR               Where the cache and the last message are kept
+                           (default: .mrpost at the repository root).
+  MRPOST_CACHE_TTL         Seconds a cached GitLab or Slack response is
+                           reused for (default: 300).
 USAGE
 }
 
@@ -66,6 +75,10 @@ copy="true"
 assume_yes=""
 stats_mode=""
 stats_since=""
+use_previous=""
+use_cache="true"
+mrpost_dir="${MRPOST_DIR:-}"
+cache_ttl="${MRPOST_CACHE_TTL:-300}"
 ignore_commenters="${MRPOST_IGNORE_COMMENTERS-ghost1}"
 # Nx Cloud posts its CI summary under a real person's account, so it cannot be
 # filtered by username. It signs the body with this HTML marker, which is a
@@ -94,6 +107,8 @@ while [[ $# -gt 0 ]]; do
     --no-copy)    copy=""; shift ;;
     -y|--yes)     assume_yes="true"; shift ;;
     --stats)      stats_mode="true"; shift ;;
+    -p|--prev)    use_previous="true"; shift ;;
+    -f|--fresh|--no-cache) use_cache=""; shift ;;
     --since)
       [ $# -ge 2 ] || { echo "--since needs a date (YYYY-MM-DD)." >&2; exit 1; }
       stats_since="$2"; shift 2 ;;
@@ -152,14 +167,82 @@ copy_to_clipboard() {
   line_cyan "Copied to clipboard."
 }
 
-for cmd in glab jq curl security; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required but not installed." >&2; exit 1; }
-done
-
 if ! git rev-parse --is-inside-work-tree &>/dev/null; then
   echo "Not inside a Git repository." >&2
   exit 1
 fi
+
+# Anchored to the repo root, not the working directory, so running from a
+# subdirectory of a monorepo shares the same cache and last message.
+if [ -z "$mrpost_dir" ]; then
+  mrpost_dir="$(git rev-parse --show-toplevel)/.mrpost"
+fi
+cache_dir="$mrpost_dir/cache"
+last_message_file="$mrpost_dir/last-message.txt"
+
+# --- Reuse the last message -------------------------------------------------
+# Before anything that needs a tool or a token: the point is to get the last
+# message back onto the clipboard without paying for any lookups.
+if [ -n "$use_previous" ]; then
+  if [ ! -r "$last_message_file" ]; then
+    echo "No saved message in $last_message_file yet." >&2
+    exit 1
+  fi
+  echo "Reusing the message built $(stat -f '%Sm' -t '%b %d %H:%M' "$last_message_file")." >&2
+  previous_message=$(cat "$last_message_file")
+  printf '%s\n' "$previous_message"
+  copy_to_clipboard "$previous_message"
+  exit 0
+fi
+
+for cmd in glab jq curl security shasum; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required but not installed." >&2; exit 1; }
+done
+
+# --- Cache ------------------------------------------------------------------
+# Every GitLab and Slack response is kept for $cache_ttl seconds, keyed by the
+# exact request, so two runs a moment apart make the requests once. Only good
+# responses are kept. Wait times are still worked out against the current
+# time, so a cached run shows current waits on the data it has. The files hold
+# Slack messages and MR notes, so the directory is private to this user.
+
+cache_file() {
+  printf '%s/%s.json' "$cache_dir" "$(printf '%s' "$1" | shasum -a 256 | cut -c1-32)"
+}
+
+# The cached response for a request key, if there is one young enough.
+cache_read() {
+  [ -n "$use_cache" ] || return 1
+  local file
+  file=$(cache_file "$1")
+  [ -r "$file" ] || return 1
+  [ $(( $(date +%s) - $(stat -f %m "$file") )) -lt "$cache_ttl" ] || return 1
+  cat "$file"
+}
+
+# A failed write only costs the next run a refetch, so it is never an error.
+cache_write() {
+  { mkdir -p "$cache_dir" && chmod 700 "$mrpost_dir" "$cache_dir" \
+      && printf '%s' "$2" > "$(cache_file "$1")"; } 2>/dev/null || true
+}
+
+# Entries outlive their use after a day; clear them so the directory does not
+# grow without bound.
+find "$cache_dir" -name '*.json' -mtime +1 -delete 2>/dev/null
+
+# One GitLab GraphQL request, through the cache.
+gitlab_graphql() {
+  local query="$1" out
+  if out=$(cache_read "graphql $query"); then
+    printf '%s' "$out"
+    return 0
+  fi
+  out=$(glab api graphql -f query="$query" 2>/dev/null)
+  if jq -e '.data != null and (.errors | not)' <<<"$out" >/dev/null 2>&1; then
+    cache_write "graphql $query" "$out"
+  fi
+  printf '%s' "$out"
+}
 
 if [ -n "$stats_mode" ]; then
   if [ -z "$stats_since" ]; then
@@ -310,7 +393,13 @@ if [ -z "$author" ]; then
   author="${MRPOST_AUTHOR:-}"
 fi
 if [ -z "$author" ]; then
-  author=$(glab api user 2>/dev/null | jq -r '.username // empty')
+  if ! user_json=$(cache_read "glab api user"); then
+    user_json=$(glab api user 2>/dev/null)
+    if jq -e '.username' <<<"$user_json" >/dev/null 2>&1; then
+      cache_write "glab api user" "$user_json"
+    fi
+  fi
+  author=$(jq -r '.username // empty' <<<"$user_json" 2>/dev/null)
 fi
 if [ -z "$author" ]; then
   echo "Could not determine a GitLab author. Set MRPOST_AUTHOR or run 'glab auth login'." >&2
@@ -338,12 +427,17 @@ if [ -z "$slack_token" ]; then
   exit 1
 fi
 
-# One Slack Web API call; prints the response, or reports why it failed. The
-# token goes in through a file descriptor so it never shows up in `ps`.
+# One Slack Web API call, through the cache; prints the response, or reports
+# why it failed. The token goes in through a file descriptor so it never shows
+# up in `ps`, and it is not part of the cache key.
 slack_api() {
   local method="$1"
   shift
-  local args=() pair out
+  local key="slack $method $*" args=() pair out
+  if out=$(cache_read "$key"); then
+    printf '%s' "$out"
+    return 0
+  fi
   for pair in "$@"; do
     args+=(--data-urlencode "$pair")
   done
@@ -356,6 +450,7 @@ slack_api() {
     line_red "Slack $method failed: $(jq -r '[.error // "unreadable response", (.needed // empty | "token needs scopes " + .)] | join(" - ")' <<<"$out" 2>/dev/null || printf '%s' "$out")"
     return 1
   fi
+  cache_write "$key" "$out"
   printf '%s' "$out"
 }
 
@@ -432,7 +527,7 @@ fetch_remaining_notes() {
 
   while [ -n "$cursor" ]; do
     progress "Fetching more notes for !${iid}..."
-    page=$(glab api graphql -f query="
+    page=$(gitlab_graphql "
 {
   project(fullPath: \"$project_path\") {
     mergeRequest(iid: \"$iid\") {
@@ -442,7 +537,7 @@ fetch_remaining_notes() {
       }
     }
   }
-}" 2>/dev/null)
+}")
 
     if ! jq -e '.data.project.mergeRequest.notes.nodes | type == "array"' <<<"${page:-null}" >/dev/null 2>&1; then
       progress_clear
@@ -470,7 +565,7 @@ fetch_mrs() {
   local filter="$1" fields="$2"
 
   progress "Fetching MRs..."
-  graph_json=$(glab api graphql -f query="
+  graph_json=$(gitlab_graphql "
 {
   project(fullPath: \"$project_path\") {
     mergeRequests($filter, first: 100) {
@@ -483,7 +578,7 @@ fetch_mrs() {
       }
     }
   }
-}" 2>/dev/null)
+}")
   progress_clear
 
   if ! jq -e '.data.project.mergeRequests.nodes | type == "array"' <<<"${graph_json:-null}" >/dev/null 2>&1; then
@@ -861,6 +956,9 @@ fi
 printf '%s\n' "$message"
 
 copy_to_clipboard "$message"
+
+# Kept for --prev. Losing it only costs a rerun, so a failed write is quiet.
+{ mkdir -p "$mrpost_dir" && printf '%s\n' "$message" > "$last_message_file"; } 2>/dev/null
 
 # A failed reply lookup still fails the run, but only after the other
 # reports, so a Slack problem never hides which MRs were dropped.
