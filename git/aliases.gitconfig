@@ -8,6 +8,7 @@
 #   fresh ColinElective/FreshShell git/aliases.gitconfig --file ~/.gitconfig.fresh
 [alias]
 	puff = pull --ff-only
+	ff = merge --ff-only
 	lb = for-each-ref --sort=committerdate refs/heads/ --format=\"%(HEAD) %(color:yellow)%(refname:short)%(color:reset) - %(color:green)%(committerdate:relative)%(color:reset) - %(color:red)%(objectname:short)%(color:reset) %(contents:subject) - %(authorname)\"
 	co = checkout
 	cp = cherry-pick
